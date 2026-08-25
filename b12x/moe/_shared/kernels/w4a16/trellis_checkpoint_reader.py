@@ -286,12 +286,19 @@ def read_trellis_checkpoint_layer(
     tile_end = (first_channel + channel_count) // 16
     hidden_tiles = H // 16
     trellis: dict[tuple[int, int], torch.Tensor] = {}
-    names = {
-        (int(m.group("expert")), _PROJ_INDEX[m.group("proj")]): name
-        for name in checkpoint.locations
-        for m in (_EXPERT_TRELLIS.match(name),)
-        if m and _layer_of(name) == layer_index
-    }
+    names: dict[tuple[int, int], str] = {}
+    for name in checkpoint.locations:
+        match = _EXPERT_TRELLIS.match(name)
+        if not match or _layer_of(name) != layer_index:
+            continue
+        key = (int(match.group("expert")), _PROJ_INDEX[match.group("proj")])
+        previous = names.setdefault(key, name)
+        if previous != name:
+            raise ValueError(
+                f"layer {layer_index} expert {key[0]} "
+                f"{PROJECTIONS[key[1]]} resolves to two trellis tensors: "
+                f"{previous!r} and {name!r}"
+            )
     for expert in range(E):
         for pi, _proj in enumerate(PROJECTIONS):
             name = names.get((expert, pi))
@@ -403,9 +410,11 @@ def prepare_trellis_checkpoint_moe_weights(
 
     raise ValueError(
         "b12x_trellis projection-tiered extents prepare through the "
-        "projection-mixed MCG K3/K4/K5 runtime (b12x PR #223); this "
-        "module provides the checkpoint contract only. Checkpoint "
-        "adapters assemble native tier storage with "
-        "assemble_trellis_projection_weights and bind it through that "
-        "runtime's tier maps."
+        "projection-mixed MCG K3/K4/K5 runtime "
+        "(b12x.moe._shared.kernels.w4a16.mixed_trellis, entry point "
+        "build_projection_tiered_maps; introduced by b12x PR #223), "
+        "which this tree does not provide. This module provides the "
+        "checkpoint contract only: checkpoint adapters assemble native "
+        "tier storage with assemble_trellis_projection_weights and bind "
+        "it through that runtime's tier maps."
     )

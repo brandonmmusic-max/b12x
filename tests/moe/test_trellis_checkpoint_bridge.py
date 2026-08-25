@@ -14,8 +14,9 @@ Two angles:
   under CUDA graph capture.
 - Divergent projection tiering with unit scale vectors: tier storage
   built directly from the source payload versus through the checkpoint
-  round-trip must produce bitwise-equal kernel output — the container,
-  reader, and assembly inject nothing.
+  round-trip must produce bitwise-equal kernel output. This arm
+  qualifies payload transparency under unit scale vectors; scale-row
+  placement is exercised by the degenerate arm's serial comparison.
 """
 
 from __future__ import annotations
@@ -82,7 +83,12 @@ def _write_bridge_checkpoint(root, triples, *, unit_scales: bool):
 
 
 def _tier_prepared(assembled, *, device: torch.device) -> tuple[list, list[int]]:
-    """Per-tier PreparedW4A16MoeWeights + tier maps from assembly output."""
+    """Per-tier PreparedW4A16MoeWeights + slot counts from assembly output.
+
+    Rotation and hidden-scale rows are placed by each projection's own
+    tier membership (gate rows by gate members, up by up, down by down),
+    matching the per-projection descriptor namespace.
+    """
 
     experts = len(assembled.gate_tiers)
     local = assembled.channel_count
@@ -96,7 +102,9 @@ def _tier_prepared(assembled, *, device: torch.device) -> tuple[list, list[int]]
         counts.append(slots)
         bits = assembled.tier_bits[tier]
 
-        def _padded(stack_map, fc1: bool) -> torch.Tensor:
+        def _padded(
+            stack_map, fc1: bool, *, bits=bits, tier=tier, slots=slots
+        ) -> torch.Tensor:
             shape = (
                 (_HIDDEN // 16, local // 16, 16 * bits)
                 if fc1
@@ -116,20 +124,34 @@ def _tier_prepared(assembled, *, device: torch.device) -> tuple[list, list[int]]
         )
         w2 = _padded(assembled.down_weights, False)
 
-        def _rows(member_ids) -> torch.Tensor:
-            table = torch.ones((slots, 3 * local), dtype=torch.float16, device=device)
+        def _segment_rows(member_ids, segment: int, *, slots=slots) -> torch.Tensor:
+            # One projection's [slots, local] slice of the rotation table,
+            # rows placed by that projection's tier-local membership.
+            table = torch.ones((slots, local), dtype=torch.float16, device=device)
+            begin = segment * local
             for slot, expert in enumerate(member_ids):
-                table[slot] = assembled.intermediate_rotations[expert]
+                table[slot] = assembled.intermediate_rotations[
+                    expert, begin : begin + local
+                ]
             return table
 
-        rotations = _rows(gate_ids)
+        rotations = torch.cat(
+            [
+                _segment_rows(gate_ids, 0),
+                _segment_rows(up_ids, 1),
+                _segment_rows(down_ids, 2),
+            ],
+            dim=1,
+        )
 
-        def _hidden_rows(table: torch.Tensor) -> torch.Tensor:
+        def _hidden_rows(
+            table: torch.Tensor, member_ids, *, slots=slots
+        ) -> torch.Tensor:
             moved = table.to(device=device)
             if moved.shape[0] == 1:
                 return moved.expand(slots, -1).contiguous()
             rows = torch.ones((slots, _HIDDEN), dtype=torch.float16, device=device)
-            for slot, expert in enumerate(gate_ids):
+            for slot, expert in enumerate(member_ids):
                 rows[slot] = moved[expert]
             return rows
 
@@ -148,10 +170,10 @@ def _tier_prepared(assembled, *, device: torch.device) -> tuple[list, list[int]]
                 w13_layout="trellis_t256_proj",
                 trellis_bits=bits,
                 codebook="mcg",
-                gate_suh=_hidden_rows(assembled.gate_suh),
-                up_suh=_hidden_rows(assembled.up_suh),
+                gate_suh=_hidden_rows(assembled.gate_suh, gate_ids),
+                up_suh=_hidden_rows(assembled.up_suh, up_ids),
                 intermediate_rotations=rotations,
-                down_svh=_hidden_rows(assembled.down_svh),
+                down_svh=_hidden_rows(assembled.down_svh, down_ids),
                 tile_config=_TILE,
             )
         )

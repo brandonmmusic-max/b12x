@@ -280,6 +280,40 @@ def test_split_nibble_rate_bytes_fail_closed(tmp_path) -> None:
         )
 
 
+def test_mcg_rates_outside_k345_fail_closed(tmp_path) -> None:
+    _write_checkpoint(tmp_path)
+    from safetensors import safe_open
+
+    path = tmp_path / "b12x-trellis.safetensors"
+    with safe_open(str(path), framework="pt") as handle:
+        tensors = {name: handle.get_tensor(name) for name in handle.keys()}
+    tensors["b12x_trellis.rate"][0, 0, 0] = 0x66
+    save_file(tensors, str(path))
+    checkpoint = read_trellis_checkpoint(tmp_path)
+    with pytest.raises(ValueError, match="rates cover K3/K4/K5"):
+        read_trellis_checkpoint_layer(
+            checkpoint, 2, first_channel=0, channel_count=_INTERMEDIATE
+        )
+
+
+def test_duplicate_payload_names_fail_closed(tmp_path) -> None:
+    _write_checkpoint(tmp_path, with_index=False)
+    save_file(
+        {
+            "extra.layers.2.mlp.experts.0.gate_proj.trellis": torch.zeros(
+                (_HIDDEN // 16, _INTERMEDIATE // 16, 16 * 3),
+                dtype=torch.int16,
+            )
+        },
+        str(tmp_path / "zz-duplicate.safetensors"),
+    )
+    checkpoint = read_trellis_checkpoint(tmp_path)
+    with pytest.raises(ValueError, match="resolves to two trellis tensors"):
+        read_trellis_checkpoint_layer(
+            checkpoint, 2, first_channel=0, channel_count=_INTERMEDIATE
+        )
+
+
 def test_payload_width_must_match_rate(tmp_path) -> None:
     _write_checkpoint(tmp_path)
     from safetensors import safe_open

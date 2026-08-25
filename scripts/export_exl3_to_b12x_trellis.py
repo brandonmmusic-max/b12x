@@ -195,6 +195,11 @@ def export(args: argparse.Namespace) -> dict:
     num_layers = int(config["num_hidden_layers"])
 
     expected = list(range(first_dense, num_layers))
+    if not expected:
+        raise _fail(
+            f"config declares no MoE layers (first_k_dense_replace="
+            f"{first_dense}, num_hidden_layers={num_layers})"
+        )
     source = _Source(model_dir, set(expected))
     layers = source.layers()
     if layers != expected:
@@ -448,7 +453,9 @@ def _verify(
             if width % block == 0:
                 extents += [(i * width, width) for i in range(4)]
         verified = 0
+        scale_verified = 0
         for layer_index in layers:
+            shared = source.shared.get(layer_index, {})
             for first, count in extents:
                 loaded = read_trellis_checkpoint_layer(
                     checkpoint,
@@ -473,17 +480,56 @@ def _verify(
                                 "round-trip"
                             )
                         verified += 1
+                        fc1 = pi < 2
+                        src_vec = _tensor(
+                            source,
+                            entries[(expert, proj)]["svh" if fc1 else "suh"],
+                        ).to(torch.float16)[first : first + count]
+                        if not torch.equal(
+                            loaded.intermediate_scales[expert, pi], src_vec
+                        ):
+                            raise _fail(
+                                f"verification failed: layer {layer_index} "
+                                f"expert {expert} {proj} intermediate scale "
+                                f"extent [{first}, {first + count}) does "
+                                "not round-trip"
+                            )
+                        scale_verified += 1
+                    for table, proj, fc1 in (
+                        (loaded.gate_suh, "gate_proj", True),
+                        (loaded.up_suh, "up_proj", True),
+                        (loaded.down_svh, "down_proj", False),
+                    ):
+                        slot = entries[(expert, proj)]
+                        entry = slot.get("suh" if fc1 else "svh")
+                        if entry is not None:
+                            src_hidden = _tensor(source, entry)
+                        else:
+                            src_hidden = _tensor(
+                                source,
+                                shared["gate_up_suh" if fc1 else "down_svh"],
+                            )
+                        row = table[0] if table.shape[0] == 1 else table[expert]
+                        if not torch.equal(row, src_hidden.to(torch.float16)):
+                            raise _fail(
+                                f"verification failed: layer {layer_index} "
+                                f"expert {expert} {proj} hidden-axis scale "
+                                "does not round-trip"
+                            )
+                        scale_verified += 1
             _tensor_cached.cache_clear()
         report["verification"] = {
             "mode": args.verify,
             "layers": layers,
             "extents": extents,
             "sections_verified": verified,
+            "scale_sections_verified": scale_verified,
             "result": "byte-identical",
         }
         print(
-            f"verification: {verified} payload sections byte-identical "
-            f"across {len(extents)} extents x {len(layers)} layers"
+            f"verification: {verified} payload sections and "
+            f"{scale_verified} scale sections byte-identical across "
+            f"{len(extents)} extents x {len(layers)} layers"
         )
 
 
@@ -509,6 +555,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--report", help="write the JSON report here")
     args = parser.parse_args(argv)
+    if args.block_size <= 0 or args.block_size % 16:
+        raise _fail(
+            f"--block-size must be a positive multiple of 16, got {args.block_size}"
+        )
     report = export(args)
     if args.report:
         path = pathlib.Path(args.report)
