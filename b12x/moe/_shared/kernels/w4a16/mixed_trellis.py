@@ -35,14 +35,15 @@ from .host import (
     route_pack_warmup_token_counts,
 )
 from .kernel import (
-    _SQG_XOR_CHEB_T12_LUT_ENTRIES,
-    _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES,
     W4A16FusedMoeKernel,
+    _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES,
     _cutlass_element_dtype,
     _fake_m_for_specialization,
+    _query_w4a16_kernel_resources,
     _trellis256_execution_lut,
     compile_w4a16_topk_sum,
     pack_topk_routes_by_expert,
+_SQG_XOR_CHEB_T12_LUT_ENTRIES,
 )
 
 
