@@ -5006,6 +5006,7 @@ def plan_b12x_fp4_moe_weights(
     trellis_codebook: str | None = None,
     trellis_rate_structure: str | None = None,
     trellis_pair_kinds: Sequence[str] | frozenset[str] | None = None,
+    trellis_projection_bits: Sequence[int] | frozenset[int] | None = None,
     coupled_hadamard_blocks: tuple[int, int] | None = None,
 ) -> MoEWeightPreparationPlan:
     """Plan the one canonical weight allocation used by selected recipes."""
@@ -5038,6 +5039,7 @@ def plan_b12x_fp4_moe_weights(
         trellis_codebook=trellis_codebook,
         trellis_rate_structure=trellis_rate_structure,
         trellis_pair_kinds=trellis_pair_kinds,
+        trellis_projection_bits=trellis_projection_bits,
         coupled_hadamard_blocks=coupled_hadamard_blocks,
     )
 

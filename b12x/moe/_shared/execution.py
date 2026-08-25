@@ -280,10 +280,12 @@ class MoEWeightPreparationPlan:
     trellis_tile_config: tuple[int, int, int, int] | None = None
     coupled_hadamard: bool = False
     # BTX declarations: the manifest-declared codebook, rate structure,
-    # pair-kind summary, and coupled-Hadamard block widths.
+    # pair-kind or projection-bit summary, and coupled-Hadamard block
+    # widths.
     trellis_codebook: str | None = None
     trellis_rate_structure: str | None = None
     trellis_pair_kinds: frozenset[str] | None = None
+    trellis_projection_bits: frozenset[int] | None = None
     coupled_hadamard_blocks: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
@@ -352,10 +354,21 @@ class MoEWeightPreparationPlan:
                     str(kind).upper() for kind in self.trellis_pair_kinds
                 )
             )
+            projection_bits = (
+                None
+                if self.trellis_projection_bits is None
+                else frozenset(
+                    int(value) for value in self.trellis_projection_bits
+                )
+            )
             if structure == "uniform":
                 if pair_kinds is not None:
                     raise ValueError(
                         "uniform btx rates declare no trellis_pair_kinds"
+                    )
+                if projection_bits is not None:
+                    raise ValueError(
+                        "uniform btx rates declare no trellis_projection_bits"
                     )
             elif structure == "per_expert_pair":
                 if self.coupled_hadamard:
@@ -388,10 +401,48 @@ class MoEWeightPreparationPlan:
                         "btx pair-kind sets must be {P33}, {P33,P24}, "
                         f"or {{P33,P43}}; got {sorted(pair_kinds)}"
                     )
+                if projection_bits is not None:
+                    raise ValueError(
+                        "per-expert-pair btx rates declare no "
+                        "trellis_projection_bits"
+                    )
+            elif structure == "per_expert_projection":
+                if self.coupled_hadamard:
+                    raise ValueError(
+                        "coupled-Hadamard btx execution is qualified "
+                        "only for uniform rate structures"
+                    )
+                if pair_kinds is not None:
+                    raise ValueError(
+                        "per-expert-projection btx rates declare no "
+                        "trellis_pair_kinds"
+                    )
+                if projection_bits is None:
+                    raise ValueError(
+                        "per-expert-projection btx rates declare "
+                        "trellis_projection_bits"
+                    )
+                for value in projection_bits:
+                    _validate_trellis_codebook_bits(codebook, value)
+                if codebook != "mcg" or not projection_bits <= frozenset(
+                    {3, 4, 5}
+                ):
+                    raise ValueError(
+                        "projection-tiered btx execution is qualified only"
+                        " for MCG bitrate sets within {3, 4, 5}; got "
+                        f"codebook {codebook!r} bits "
+                        f"{sorted(projection_bits)}"
+                    )
+                if bits != 3:
+                    raise ValueError(
+                        "per-expert-projection btx rates require the "
+                        "trellis_bits=3 base specialization"
+                    )
             else:
                 raise ValueError(
-                    "trellis_rate_structure must be 'uniform' or "
-                    f"'per_expert_pair'; got {structure!r}"
+                    "trellis_rate_structure must be 'uniform', "
+                    "'per_expert_pair', or 'per_expert_projection'; got "
+                    f"{structure!r}"
                 )
             blocks = (
                 None
@@ -419,6 +470,9 @@ class MoEWeightPreparationPlan:
                 )
             object.__setattr__(self, "trellis_rate_structure", structure)
             object.__setattr__(self, "trellis_pair_kinds", pair_kinds)
+            object.__setattr__(
+                self, "trellis_projection_bits", projection_bits
+            )
             object.__setattr__(self, "coupled_hadamard_blocks", blocks)
         elif (
             self.trellis_bits is not None
@@ -427,6 +481,7 @@ class MoEWeightPreparationPlan:
             or self.trellis_codebook is not None
             or self.trellis_rate_structure is not None
             or self.trellis_pair_kinds is not None
+            or self.trellis_projection_bits is not None
             or self.coupled_hadamard_blocks is not None
         ):
             raise ValueError(
@@ -728,6 +783,7 @@ def plan_moe_weight_preparation(
     trellis_codebook: str | None = None,
     trellis_rate_structure: str | None = None,
     trellis_pair_kinds: Iterable[str] | None = None,
+    trellis_projection_bits: Iterable[int] | None = None,
     coupled_hadamard_blocks: tuple[int, int] | None = None,
 ) -> MoEWeightPreparationPlan:
     """Choose the minimal representation set for the requested recipes.
@@ -975,6 +1031,11 @@ def plan_moe_weight_preparation(
             None
             if trellis_pair_kinds is None
             else frozenset(str(kind) for kind in trellis_pair_kinds)
+        ),
+        trellis_projection_bits=(
+            None
+            if trellis_projection_bits is None
+            else frozenset(int(bits) for bits in trellis_projection_bits)
         ),
         coupled_hadamard_blocks=coupled_hadamard_blocks,
     )
