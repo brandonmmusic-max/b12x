@@ -230,6 +230,12 @@ def _serial_tier(x, prepared, topk_weights, topk_ids, expert_map):
         output_expert_map=expert_map,
         route_block_size_m=8,
         intermediate_rotation_scales=prepared.intermediate_rotations,
+        full_rotation=True,
+        suh_gate_table=prepared.gate_suh,
+        suh_up_table=prepared.up_suh,
+        svh_table=prepared.down_svh,
+        rotation_a_gate=buffers.rotation_a_gate,
+        rotation_a_up=buffers.rotation_a_up,
     )
 
 
