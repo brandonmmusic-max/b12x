@@ -58,47 +58,61 @@ _QUANT_BLOCK = {
 }
 
 
-def _write_checkpoint(root: pathlib.Path, *, with_index: bool = True) -> dict:
+def _write_checkpoint(
+    root: pathlib.Path,
+    *,
+    with_index: bool = True,
+    hidden: int = _HIDDEN,
+    intermediate: int = _INTERMEDIATE,
+    moe_layers: tuple[int, ...] = _MOE_LAYERS,
+    triples: tuple[tuple[int, int, int], ...] = _TRIPLES,
+    block_size: int = 128,
+    unit_scales: bool = False,
+) -> dict:
     """Write a synthetic v2 checkpoint; return its source tensors."""
 
     generator = torch.Generator().manual_seed(20260824)
     root.mkdir(parents=True, exist_ok=True)
-    L, E = len(_MOE_LAYERS), _EXPERTS
+    L, E = len(moe_layers), len(triples)
+    quant_block = copy.deepcopy(_QUANT_BLOCK)
+    quant_block["b12x_trellis"]["transform"]["projection"]["block_size"] = block_size
     config = {
-        "hidden_size": _HIDDEN,
-        "moe_intermediate_size": _INTERMEDIATE,
+        "hidden_size": hidden,
+        "moe_intermediate_size": intermediate,
         "n_routed_experts": E,
-        "first_k_dense_replace": _MOE_LAYERS[0],
-        "num_hidden_layers": _MOE_LAYERS[-1] + 1,
-        "quantization_config": copy.deepcopy(_QUANT_BLOCK),
+        "first_k_dense_replace": moe_layers[0],
+        "num_hidden_layers": moe_layers[-1] + 1,
+        "quantization_config": quant_block,
     }
     (root / "config.json").write_text(json.dumps(config, indent=1))
 
     rate = torch.zeros((L, E, 3), dtype=torch.uint8)
-    input_scales = torch.zeros((L, _HIDDEN), dtype=torch.float16)
-    output_scales = torch.zeros((L, _HIDDEN), dtype=torch.float16)
-    inter = torch.zeros((L, E, 3, _INTERMEDIATE), dtype=torch.float16)
+    input_scales = torch.zeros((L, hidden), dtype=torch.float16)
+    output_scales = torch.zeros((L, hidden), dtype=torch.float16)
+    inter = torch.zeros((L, E, 3, intermediate), dtype=torch.float16)
     source: dict = {"payload": {}, "weight_map": {}}
 
     def _values(shape):
+        if unit_scales:
+            return torch.ones(shape, dtype=torch.float16)
         raw = torch.rand(shape, generator=generator, dtype=torch.float32)
         return (0.5 + raw).to(torch.float16)
 
-    for row, layer in enumerate(_MOE_LAYERS):
+    for row, layer in enumerate(moe_layers):
         tensors = {}
-        input_scales[row] = _values((_HIDDEN,))
-        output_scales[row] = _values((_HIDDEN,))
-        for expert, triple in enumerate(_TRIPLES):
+        input_scales[row] = _values((hidden,))
+        output_scales[row] = _values((hidden,))
+        for expert, triple in enumerate(triples):
             for pi, (proj, bits) in enumerate(
                 zip(("gate_proj", "up_proj", "down_proj"), triple, strict=True)
             ):
                 rate[row, expert, pi] = rate_byte(bits)
-                inter[row, expert, pi] = _values((_INTERMEDIATE,))
+                inter[row, expert, pi] = _values((intermediate,))
                 fc1 = pi < 2
                 shape = (
-                    (_HIDDEN // 16, _INTERMEDIATE // 16, 16 * bits)
+                    (hidden // 16, intermediate // 16, 16 * bits)
                     if fc1
-                    else (_INTERMEDIATE // 16, _HIDDEN // 16, 16 * bits)
+                    else (intermediate // 16, hidden // 16, 16 * bits)
                 )
                 name = f"model.layers.{layer}.mlp.experts.{expert}.{proj}.trellis"
                 payload = torch.randint(
