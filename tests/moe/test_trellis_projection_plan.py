@@ -52,7 +52,11 @@ def test_projection_plan_accepts_bit_subsets() -> None:
     (
         (
             {"trellis_projection_bits": None},
-            "declare trellis_projection_bits",
+            "non-empty trellis_projection_bits",
+        ),
+        (
+            {"trellis_projection_bits": ()},
+            "non-empty trellis_projection_bits",
         ),
         ({"trellis_pair_kinds": ("P33",)}, "no trellis_pair_kinds"),
         ({"trellis_projection_bits": (3, 4, 6)}, "within {3, 4, 5}"),

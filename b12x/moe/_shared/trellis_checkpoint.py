@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .trellis_codebooks import CODEBOOKS, validate_codebook_bits
+from .trellis_codebooks import CODEBOOKS, MCG, validate_codebook_bits
 
 QUANT_METHOD = "b12x_trellis"
 TRELLIS_CHECKPOINT_VERSION = 2
@@ -225,6 +225,11 @@ class TrellisCheckpointConfig:
 
     def validate_bits(self, bits: int) -> None:
         validate_codebook_bits(self.codebook, bits)
+        # The version-2 rate vocabulary pins MCG whole-matrix rates to
+        # K3/K4/K5 (rate bytes 0x33/0x44/0x55); the registry alone would
+        # admit any MCG tile bitrate.
+        if self.codebook == MCG and bits not in (3, 4, 5):
+            raise ValueError(f"b12x_trellis mcg rates cover K3/K4/K5; got K{bits}")
 
     def rate_shape(self, num_layers: int, num_experts: int) -> tuple[int, ...]:
         return (num_layers, num_experts, len(PROJECTIONS))

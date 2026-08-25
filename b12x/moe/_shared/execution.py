@@ -417,10 +417,10 @@ class MoEWeightPreparationPlan:
                         "per-expert-projection btx rates declare no "
                         "trellis_pair_kinds"
                     )
-                if projection_bits is None:
+                if not projection_bits:
                     raise ValueError(
                         "per-expert-projection btx rates declare "
-                        "trellis_projection_bits"
+                        "non-empty trellis_projection_bits"
                     )
                 for value in projection_bits:
                     _validate_trellis_codebook_bits(codebook, value)

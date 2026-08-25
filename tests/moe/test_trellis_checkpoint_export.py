@@ -140,7 +140,7 @@ def test_export_elects_granularities_and_verifies(tmp_path, layout) -> None:
     expected_hidden = "per_layer" if layout == "shared" else "per_expert"
     assert report["elections"]["input_scales"] == expected_hidden
     assert report["elections"]["output_scales"] == expected_hidden
-    assert report["gate_up_divergent_assignments"] == 2  # experts 0 and 2
+    assert report["gate_up_divergent_assignments"] == 2  # expert 0, both layers
 
     checkpoint = read_trellis_checkpoint(_as_v2_dir(source, output))
     layer = read_trellis_checkpoint_layer(

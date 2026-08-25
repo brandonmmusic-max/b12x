@@ -125,8 +125,11 @@ preparation fails closed with a status message.
 - **Declared, adapter-prepared**: `per_expert_projection` rates over MCG
   bitrate sets within {K3, K4, K5}, `scaled_hadamard` projection
   transform, `gains: none`. The declaration, validation, slicing, and
-  native tier assembly are complete; fused execution binds through
-  PR #223's three-tier runtime.
+  native tier assembly are complete; fused execution binds through the
+  three-tier runtime in
+  `b12x/moe/_shared/kernels/w4a16/mixed_trellis.py` (PR #223). Where
+  that runtime is absent, projection-tiered preparation is unsupported
+  and fails closed.
 - Other codebooks, bitrate sets, transform kinds, and gain declarations
   fail closed at validation with a status message naming the unsupported
   field.
