@@ -39,6 +39,7 @@ route histogram and task queue while consuming the same prepared weights.
 
 from __future__ import annotations
 
+import os
 from typing import Tuple
 
 import cuda.bindings.driver as cuda
@@ -68,6 +69,7 @@ from b12x._lib.intrinsics import (
     cp_async4_shared_global,
     cp_async_u32_shared_global,
     cp_async_u64_shared_global,
+    div_rn_f32,
     e2m1x8_mul_residual_to_e4m3x8,
     e2m1x8_to_qmma_e2m1x8,
     fabs_f32,
@@ -85,6 +87,7 @@ from b12x._lib.intrinsics import (
     quantize_block_fp4,
     quantize_block_fp4_fast,
     quantize_block_fp8_mx,
+    ue8m0_to_output_scale,
     get_ptr_as_int64,
     st_global_f32,
     st_global_i32,
@@ -128,7 +131,7 @@ from b12x.moe._shared.kernels.w4a8_trellis_decode import (
     _w4a8_had128_quad,
     _w4a8_stage_trellis_b_tile,
     _w4a8_trellis_lane_geom,
-    _w4a8_trellis_pair_words,
+    _w4a8_trellis_pair_words as _w4a8_trellis_pair_words_sqg,
     _w4a8_trellis_permute_k32,
 )
 from b12x.moe._shared.kernels.w4a8_phase1 import (
@@ -166,6 +169,243 @@ _WORK_SOURCES = {
 # alignment = copy size) and 20*g mod 32 spreads the eight g-rows a lane
 # quad touches across distinct bank groups.
 _W4A8_B_ROW_PAD = 80
+
+# Exact float32 encodings used by torch's terminal ``/ sqrt(N)`` in the
+# full-coupled CPU reference.  The previous input owner multiplied by the
+# reciprocal twice (H128 then H4), which is algebraically equivalent but can
+# move an E4M3 tie by one code.  Keep these as divisors and use div.rn.f32.
+_P8_SQRT128_F32 = 11.313708305358887  # 0x413504f3
+_P8_SQRT512_F32 = 22.627416610717773  # 0x41b504f3
+
+
+@dsl_user_op
+def _p8_mul_rn_f32(
+    a: cutlass.Float32,
+    b: cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Float32:
+    """One separately rounded FP32 multiply, opaque to FMA contraction."""
+
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(b).ir_value(loc=loc, ip=ip),
+            ],
+            "mul.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def _p8_had128_quad_unnormalized(
+    v0: cutlass.Float32,
+    v1: cutlass.Float32,
+    v2: cutlass.Float32,
+    v3: cutlass.Float32,
+    lane: Int32,
+):
+    """Natural-order Sylvester H128 without terminal normalization."""
+
+    s0 = v0 + v1
+    d0 = v0 - v1
+    s1 = v2 + v3
+    d1 = v2 - v3
+    h0 = s0 + s1
+    h1 = d0 + d1
+    h2 = s0 - s1
+    h3 = d0 - d1
+    for i in cutlass.range_constexpr(5):
+        stride = 1 << i
+        p0 = cute.arch.shuffle_sync_bfly(h0, offset=stride)
+        p1 = cute.arch.shuffle_sync_bfly(h1, offset=stride)
+        p2 = cute.arch.shuffle_sync_bfly(h2, offset=stride)
+        p3 = cute.arch.shuffle_sync_bfly(h3, offset=stride)
+        if (lane & Int32(stride)) != Int32(0):
+            h0 = p0 - h0
+            h1 = p1 - h1
+            h2 = p2 - h2
+            h3 = p3 - h3
+        else:
+            h0 = p0 + h0
+            h1 = p1 + h1
+            h2 = p2 + h2
+            h3 = p3 + h3
+    return h0, h1, h2, h3
+
+
+@cute.jit
+def _p8_had128_quad_reference_order(
+    v0: cutlass.Float32,
+    v1: cutlass.Float32,
+    v2: cutlass.Float32,
+    v3: cutlass.Float32,
+    lane: Int32,
+):
+    """H128 with the CPU reference's one correctly-rounded terminal divide."""
+
+    h0, h1, h2, h3 = _p8_had128_quad_unnormalized(v0, v1, v2, v3, lane)
+    divisor = cutlass.Float32(_P8_SQRT128_F32)
+    return (
+        div_rn_f32(h0, divisor),
+        div_rn_f32(h1, divisor),
+        div_rn_f32(h2, divisor),
+        div_rn_f32(h3, divisor),
+    )
+
+
+@cute.jit
+def _p8_h512_mix_reference_order(
+    x0: cutlass.Float32,
+    x1: cutlass.Float32,
+    x2: cutlass.Float32,
+    x3: cutlass.Float32,
+):
+    """Finish H512 exactly as CPU butterfly strides 128 then 256."""
+
+    r0 = x0 + x1
+    r1 = x0 - x1
+    r2 = x2 + x3
+    r3 = x2 - x3
+    divisor = cutlass.Float32(_P8_SQRT512_F32)
+    return (
+        div_rn_f32(r0 + r2, divisor),
+        div_rn_f32(r1 + r3, divisor),
+        div_rn_f32(r0 - r2, divisor),
+        div_rn_f32(r1 - r3, divisor),
+    )
+
+
+@dsl_user_op
+def _packed_decode_trellis_mcg2_to_e4m3x8(
+    win_a,
+    win_b,
+    bits: int,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Decode eight procedural MCG states directly to scaled E4M3 bytes.
+
+    This is the P8 law used by the no-LDLQ pseudoquant encoder: the original
+    ExLlamaV3 MCG state value is multiplied by the frozen family compander
+    ``2.0`` and rounded once to finite E4M3. The result stays in the native
+    B-register form consumed by ``mxf8f6f4.m16n8k32``.
+    """
+    bits = int(bits)
+    if bits not in (3, 4, 5):
+        raise ValueError(f"P8 MCG supports K3/K4/K5 trellis streams, got K{bits}")
+    asm = """
+        {
+            .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, lo, hi, M;
+            .reg .b32 h01,h23,h45,h67;
+            .reg .b16 e01,e23,e45,e67;
+            mov.b32 M, 0xCBAC1FED;
+            and.b32 w7, $2, 0xffff;
+            shr.u32 w6, $2, __B1__;  and.b32 w6, w6, 0xffff;
+            shr.u32 w5, $2, __B2__;  and.b32 w5, w5, 0xffff;
+            shr.u32 w4, $2, __B3__;  and.b32 w4, w4, 0xffff;
+            and.b32 w3, $3, 0xffff;
+            shr.u32 w2, $3, __B1__;  and.b32 w2, w2, 0xffff;
+            shr.u32 w1, $3, __B2__;  and.b32 w1, w1, 0xffff;
+            shr.u32 w0, $3, __B3__;  and.b32 w0, w0, 0xffff;
+            mul.lo.u32 w0, w0, M;  lop3.b32 w0, w0, 0x8FFF8FFF, 0x3B603B60, 0x6a;
+            mul.lo.u32 w1, w1, M;  lop3.b32 w1, w1, 0x8FFF8FFF, 0x3B603B60, 0x6a;
+            mul.lo.u32 w2, w2, M;  lop3.b32 w2, w2, 0x8FFF8FFF, 0x3B603B60, 0x6a;
+            mul.lo.u32 w3, w3, M;  lop3.b32 w3, w3, 0x8FFF8FFF, 0x3B603B60, 0x6a;
+            mul.lo.u32 w4, w4, M;  lop3.b32 w4, w4, 0x8FFF8FFF, 0x3B603B60, 0x6a;
+            mul.lo.u32 w5, w5, M;  lop3.b32 w5, w5, 0x8FFF8FFF, 0x3B603B60, 0x6a;
+            mul.lo.u32 w6, w6, M;  lop3.b32 w6, w6, 0x8FFF8FFF, 0x3B603B60, 0x6a;
+            mul.lo.u32 w7, w7, M;  lop3.b32 w7, w7, 0x8FFF8FFF, 0x3B603B60, 0x6a;
+            prmt.b32 lo, w0, w1, 0x5410;  prmt.b32 hi, w0, w1, 0x7632;  add.rn.f16x2 h01, lo, hi;
+            prmt.b32 lo, w2, w3, 0x5410;  prmt.b32 hi, w2, w3, 0x7632;  add.rn.f16x2 h23, lo, hi;
+            prmt.b32 lo, w4, w5, 0x5410;  prmt.b32 hi, w4, w5, 0x7632;  add.rn.f16x2 h45, lo, hi;
+            prmt.b32 lo, w6, w7, 0x5410;  prmt.b32 hi, w6, w7, 0x7632;  add.rn.f16x2 h67, lo, hi;
+            add.rn.f16x2 h01, h01, h01;
+            add.rn.f16x2 h23, h23, h23;
+            add.rn.f16x2 h45, h45, h45;
+            add.rn.f16x2 h67, h67, h67;
+            cvt.rn.satfinite.e4m3x2.f16x2 e01, h01;
+            cvt.rn.satfinite.e4m3x2.f16x2 e23, h23;
+            cvt.rn.satfinite.e4m3x2.f16x2 e45, h45;
+            cvt.rn.satfinite.e4m3x2.f16x2 e67, h67;
+            mov.b32 $0, {e01, e23};
+            mov.b32 $1, {e45, e67};
+        }
+        """
+    asm = (
+        asm.replace("__B1__", str(bits))
+        .replace("__B2__", str(2 * bits))
+        .replace("__B3__", str(3 * bits))
+    )
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [
+            Uint32(win_a).ir_value(loc=loc, ip=ip),
+            Uint32(win_b).ir_value(loc=loc, ip=ip),
+        ],
+        asm,
+        "=r,=r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+    return Uint32(lo), Uint32(hi)
+
+
+@cute.jit
+def _w4a8_trellis_pair_words_mcg(
+    smem_base: Int32,
+    lane: Int32,
+    base0_u32: Int32,
+    base1_u32: Int32,
+    ia: Int32,
+    ib: Int32,
+    s2: Int32,
+    n_high: Int32,
+    bits: cutlass.Constexpr,
+):
+    """Decode adjacent K16 MCG windows and butterfly into MMA B order."""
+    words = cute.make_rmem_tensor((4,), Uint32)
+    for which in cutlass.range_constexpr(2):
+        base = base0_u32
+        if which == 1:
+            base = base1_u32
+        a = Uint32(ld_shared_u32(smem_base + ((base + ia) << Int32(2))))
+        b = Uint32(ld_shared_u32(smem_base + ((base + ib) << Int32(2))))
+        merged = (Int64(a) << Int64(32)) | Int64(b)
+        win_a = Uint32(merged >> Int64(s2))
+        win_b = Uint32(merged >> Int64(s2 + Int32(4 * int(bits))))
+        lo, hi = _packed_decode_trellis_mcg2_to_e4m3x8(
+            win_a, win_b, int(bits)
+        )
+        words[which * 2] = lo
+        words[which * 2 + 1] = hi
+    e0 = words[0]
+    e1 = words[2]
+    if n_high != Int32(0):
+        e0 = words[1]
+        e1 = words[3]
+    lane_quarter = lane & Int32(3)
+    own = e0
+    send = e1
+    if lane_quarter >= Int32(2):
+        own = e1
+        send = e0
+    return own, Uint32(cute.arch.shuffle_sync_bfly(send, offset=2))
 
 
 @cute.jit
@@ -207,6 +447,24 @@ def _load_bf16x32_to_f32(
         block_max = fmax_f32(block_max, fabs_f32(v6))
         block_max = fmax_f32(block_max, fabs_f32(v7))
     return values, block_max
+
+
+@cute.jit
+def _p8_scale_input_before_h128(
+    value: cutlass.Float32,
+    scale_component: cute.Tensor,
+    input_col: Int32,
+) -> cutlass.Float32:
+    """Apply shared gate/up suh at Luke's exact pre-H128 FP16 boundary.
+
+    This helper must run before both ``_w4a8_had128_quad`` and the E4M3 K32
+    amax.  The scale component occupies the first H=4096 FP16 elements of the
+    packed transform operand.  H512, when enabled by the coupled owner, runs
+    before this helper and is not part of the scale component.
+    """
+
+    scaled = value * scale_component[input_col].to(cutlass.Float32)
+    return cutlass.Float16(scaled).to(cutlass.Float32)
 
 
 _W4A8_TMA_TILE_BYTES = 128 * 64  # one (128 n, 128 fp4-k) TMA box
@@ -698,6 +956,10 @@ class MoEDynamicKernelBackend:
         direct_routing: bool = False,
         external_route_plan: bool = False,
         materialize_intermediate: bool = False,
+        p8_small_m: bool = False,
+        p8_fc1_tile_n: int = 128,
+        p8_scale_sandwich: bool = False,
+        p8_full_coupled: bool = False,
         work_source: str = _WORK_SOURCE_MATERIALIZED_QUEUE,
         swiglu_limit: float | None = None,
         swiglu_alpha: float | None = None,
@@ -707,6 +969,9 @@ class MoEDynamicKernelBackend:
         trellis_bits: int | None = None,
         trellis_coupled: bool = False,
         trellis_direct_lut: bool = False,
+        trellis_codebook: str | None = None,
+        trellis_scaled: bool = False,
+        trellis_identity_boundary: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         if quant_recipe not in {
@@ -758,6 +1023,9 @@ class MoEDynamicKernelBackend:
         # m16n8k32 MMA. It rides the nvfp4-shaped TMA route/pack/mainloop
         # machinery (NOT the raw w4a8 path), so is_w4a8 stays False for it.
         self.is_w6a8 = quant_recipe == "w6a8_mx"
+        self.mxfp6_h16_all = self.is_w6a8 and os.environ.get(
+            "GLM53_MXFP6_H16_ALL", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
         if self.is_w6a8:
             if mxfp6_fmt_a is None:
                 mxfp6_fmt_a = "e4m3"
@@ -806,9 +1074,18 @@ class MoEDynamicKernelBackend:
         # format differ.
         self.w4a8_trellis = quant_recipe == "w4a8_trellis"
         if self.w4a8_trellis:
-            if trellis_bits not in (2, 3, 4):
+            if trellis_codebook is None:
+                trellis_codebook = os.environ.get(
+                    "B12X_TRELLIS_CODEBOOK", "sqg-xor-cheb-t12"
+                ).strip().lower()
+            if trellis_codebook not in {"sqg-xor-cheb-t12", "mcg"}:
                 raise ValueError(
-                    "w4a8_trellis requires trellis_bits in {2, 3, 4}, "
+                    "w4a8_trellis codebook must be 'sqg-xor-cheb-t12' or "
+                    f"'mcg', got {trellis_codebook!r}"
+                )
+            if trellis_bits not in (2, 3, 4, 5):
+                raise ValueError(
+                    "w4a8_trellis requires trellis_bits in {2, 3, 4, 5}, "
                     f"got {trellis_bits!r}"
                 )
             if not w4a8_repacked:
@@ -830,9 +1107,26 @@ class MoEDynamicKernelBackend:
                     "w4a8_trellis requires a gated activation (the trellis "
                     "activation boundary rotates gate and up jointly)"
                 )
+            if trellis_codebook == "mcg" and trellis_bits == 2:
+                raise ValueError("P8 MCG supports K3/K4/K5, not K2")
+            if trellis_codebook == "sqg-xor-cheb-t12" and trellis_bits == 5:
+                raise ValueError("SQG W4A8 supports K2/K3/K4; K5 requires MCG")
         elif trellis_bits is not None:
             raise ValueError("trellis_bits is only valid for w4a8_trellis")
         self.trellis_bits = 0 if trellis_bits is None else int(trellis_bits)
+        self.trellis_codebook = (
+            "none" if trellis_codebook is None else str(trellis_codebook)
+        )
+        if trellis_scaled and not self.w4a8_trellis:
+            raise ValueError("trellis_scaled requires quant_recipe='w4a8_trellis'")
+        self.trellis_scaled = bool(trellis_scaled)
+        if trellis_identity_boundary and not self.w4a8_trellis:
+            raise ValueError(
+                "trellis_identity_boundary requires quant_recipe='w4a8_trellis'"
+            )
+        if trellis_identity_boundary and trellis_coupled:
+            raise ValueError("identity and coupled trellis boundaries are exclusive")
+        self.trellis_identity_boundary = bool(trellis_identity_boundary)
         if trellis_coupled and not self.w4a8_trellis:
             raise ValueError("trellis_coupled requires quant_recipe='w4a8_trellis'")
         self.trellis_coupled = bool(trellis_coupled)
@@ -841,6 +1135,54 @@ class MoEDynamicKernelBackend:
         self.direct_routing = bool(direct_routing)
         self.external_route_plan = bool(external_route_plan)
         self.materialize_intermediate = bool(materialize_intermediate)
+        self.p8_small_m = bool(p8_small_m)
+        self.p8_fc1_tile_n = int(p8_fc1_tile_n)
+        self.p8_scale_sandwich = bool(p8_scale_sandwich)
+        self.p8_full_coupled = bool(p8_full_coupled)
+        self.p8_grouped_m16 = bool(
+            self.p8_full_coupled and materialize_intermediate
+            and not direct_routing and mma_tiler_mn == (16, 128)
+            and share_input_across_experts and deterministic_output
+            and quant_recipe == "w4a8_trellis" and trellis_codebook == "mcg"
+            and trellis_scaled and w4a8_repacked
+        )
+        # Opt-in closure diagnostic only. The P8 wrapper may enable this on a
+        # dedicated compiled arm and provide a 512-byte carrier through the
+        # otherwise compile-time-dead MCG trellis_lut operand. The ordinary
+        # serving specialization leaves it false and emits no trace stores.
+        self.p8_input_prequant_diagnostic = False
+        if self.p8_full_coupled and not self.p8_scale_sandwich:
+            raise ValueError("full-coupled P8 requires the scale sandwich")
+        if self.p8_full_coupled and trellis_identity_boundary:
+            raise ValueError("full-coupled P8 cannot advertise identity boundary")
+        if self.p8_fc1_tile_n not in (32, 64, 128):
+            raise ValueError("P8 FC1 N must be 32, 64, or 128")
+        if self.p8_fc1_tile_n != 128 and not self.p8_small_m:
+            raise ValueError("Narrow FC1 requires P8 small-M")
+        if self.p8_scale_sandwich and not (
+            (self.p8_small_m and self.p8_fc1_tile_n == 128)
+            or (
+                self.p8_full_coupled
+                and materialize_intermediate
+                and (mma_tiler_mn == (64, 128) or self.p8_grouped_m16)
+                and share_input_across_experts
+                and deterministic_output
+                and not direct_routing
+            )
+        ):
+            raise ValueError(
+                "P8 scale sandwich requires exact M1 or full-coupled M64/N128 ownership"
+            )
+        if self.p8_small_m and not (
+            quant_recipe == "w4a8_trellis" and trellis_codebook == "mcg"
+            and trellis_bits in (3, 4, 5) and trellis_scaled
+            and (trellis_identity_boundary or self.p8_full_coupled)
+            and deterministic_output and w4a8_repacked and direct_routing
+            and materialize_intermediate and share_input_across_experts
+            and mma_tiler_mn == (16, 128) and activation == "silu"
+            and num_topk == 8 and not trellis_coupled and not trellis_direct_lut
+        ):
+            raise ValueError("P8 small-M requires the frozen M1 scaled-MCG contract")
         self.w4a8_m1_materialized = bool(
             self.w4a8_repacked
             and self.direct_routing
@@ -858,7 +1200,7 @@ class MoEDynamicKernelBackend:
             and mma_tiler_mn == (64, 128)
         )
         self.w4a8_split_materialized = bool(
-            self.w4a8_m64_materialized or self.w4a8_m128_materialized
+            self.w4a8_m64_materialized or self.w4a8_m128_materialized or self.p8_grouped_m16
         )
         # Dense M64/M128 retains this kernel as a routing/input-quantization
         # front-end. Compact stream-ordered M64xN128 kernels compute FC1/FC2
@@ -866,14 +1208,48 @@ class MoEDynamicKernelBackend:
         # removes both GEMM bodies from the routing kernel's register/shared
         # union and is graph-safe: every grid is fixed from preplanned launch
         # capacity and no host value is read between launches.
-        self.external_materialized_fc1 = self.w4a8_split_materialized
-        self.external_materialized_fc2 = self.w4a8_split_materialized
+        self.external_materialized_fc1 = (
+            self.w4a8_split_materialized
+            or self.p8_fc1_tile_n != 128
+            # The N128 M1 scale-sandwich/full-coupled boundary is implemented
+            # only by P8H128FC1Kernel.  Leaving it in the monolithic consumer
+            # silently skips H128/svh and makes that owner (and its diagnostic
+            # subclass) dead code.
+            or (self.p8_small_m and self.p8_scale_sandwich)
+        )
+        self.external_materialized_fc2 = self.w4a8_split_materialized or self.p8_small_m
         if int(num_topk) <= 0:
             raise ValueError(f"num_topk must be positive, got {num_topk}")
         self.num_topk = int(num_topk)
         materialized_source_tile_m = (
             mma_tiler_mn[0] if self.w4a8_split_materialized else 128
         )
+        if self.p8_grouped_m16:
+            # Inert upstream placeholders require M64/M128. Both are replaced
+            # below by the M16 P8 owners before any launch.
+            materialized_source_tile_m = 64
+        # The upstream W4A8 phase kernels accept rates 2-4 only; K5 lives exclusively in the
+        # P8 subclasses below. Both base kernels constructed here are replaced by a P8 owner
+        # whenever one of the P8 paths is active, and the discarded instances are never
+        # launched, so at K5 they are built inert (no trellis) rather than with a rate the
+        # parent cannot express. If no P8 owner would replace them, the rate is passed through
+        # unchanged and the parent's own validation rejects K5, which is the correct outcome.
+        _p8_owns_phase1 = (
+            self.p8_grouped_m16 or
+            (self.p8_full_coupled and self.w4a8_m64_materialized)
+            or self.p8_scale_sandwich
+            or self.p8_fc1_tile_n != 128
+        )
+        _p8_owns_phase2 = (
+            self.p8_grouped_m16 or
+            (self.p8_full_coupled and self.w4a8_m64_materialized) or self.p8_small_m
+        )
+        _base_bits_unsupported = trellis_bits is not None and int(trellis_bits) not in (2, 3, 4)
+        # An inert base kernel must be inert in every trellis argument, not only the rate:
+        # the parent rejects trellis_scaled/coupled/identity without a payload. Treating the
+        # discarded instance as non-split reproduces the documented inert specialization.
+        _p1_split = self.w4a8_split_materialized and not (_base_bits_unsupported and _p8_owns_phase1)
+        _p2_split = self.w4a8_split_materialized and not (_base_bits_unsupported and _p8_owns_phase2)
         self.materialized_phase1_kernel = W4A8MaterializedPhase1Kernel(
             fast_math=self.fast_math,
             source_tile_m=materialized_source_tile_m,
@@ -881,33 +1257,92 @@ class MoEDynamicKernelBackend:
             num_topk=self.num_topk,
             trellis_bits=(
                 trellis_bits
-                if self.w4a8_trellis and self.w4a8_split_materialized
+                if self.w4a8_trellis and _p1_split
                 else None
             ),
             trellis_coupled=(
-                self.trellis_coupled and self.w4a8_split_materialized
+                self.trellis_coupled and _p1_split
             ),
             trellis_direct_lut=(
-                self.trellis_direct_lut and self.w4a8_split_materialized
+                self.trellis_direct_lut and _p1_split
             ),
             # This helper is gated-only and is never launched unless the split
             # materialized path is active.  Use a valid inert specialization for
             # non-split activations (notably ReLU2) instead of rejecting them
             # during otherwise valid monolithic-kernel construction.
-            activation=self.activation if self.w4a8_split_materialized else "silu",
+            activation=self.activation if _p1_split else "silu",
+            trellis_codebook=(
+                self.trellis_codebook if _p1_split else "none"
+            ),
+            trellis_scaled=self.trellis_scaled and _p1_split,
+            trellis_identity_boundary=(
+                self.trellis_identity_boundary and _p1_split
+            ),
         )
         self.materialized_phase2_kernel = W4A8MaterializedPhase2Kernel(
             source_tile_m=materialized_source_tile_m,
             deterministic_output=bool(deterministic_output),
             trellis_bits=(
                 trellis_bits
-                if self.w4a8_trellis and self.w4a8_split_materialized
+                if self.w4a8_trellis and _p2_split
                 else None
             ),
             trellis_direct_lut=(
-                self.trellis_direct_lut and self.w4a8_split_materialized
+                self.trellis_direct_lut and _p2_split
+            ),
+            trellis_codebook=(
+                self.trellis_codebook if _p2_split else "none"
+            ),
+            trellis_scaled=self.trellis_scaled and _p2_split,
+            trellis_identity_boundary=(
+                self.trellis_identity_boundary and _p2_split
             ),
         )
+        if self.p8_small_m:
+            from b12x.moe._shared.kernels.p8_small_m import P8SmallMPhase2Kernel
+            self.materialized_phase2_kernel = P8SmallMPhase2Kernel(
+                trellis_bits=trellis_bits
+            )
+            if self.p8_scale_sandwich:
+                self.materialized_phase2_kernel = P8SmallMPhase2Kernel(
+                    scale_sandwich=True,
+                    full_coupled=self.p8_full_coupled,
+                    trellis_bits=trellis_bits,
+                )
+        if self.p8_grouped_m16:
+            from b12x.moe._shared.kernels.p8_grouped_m16 import P8GroupedM16FC1Kernel, P8GroupedM16FC2Kernel
+            self.materialized_phase1_kernel = P8GroupedM16FC1Kernel(trellis_bits=trellis_bits)
+            self.materialized_phase2_kernel = P8GroupedM16FC2Kernel(trellis_bits=trellis_bits)
+        elif self.p8_full_coupled and self.w4a8_m64_materialized:
+            from b12x.moe._shared.kernels.p8_coupled_prefill_fc1 import (
+                P8CoupledPrefillFC1Kernel,
+            )
+            from b12x.moe._shared.kernels.p8_coupled_prefill_fc2 import (
+                P8CoupledPrefillFC2Kernel,
+            )
+            self.materialized_phase1_kernel = P8CoupledPrefillFC1Kernel(trellis_bits=trellis_bits)
+            self.materialized_phase2_kernel = P8CoupledPrefillFC2Kernel(trellis_bits=trellis_bits)
+        elif self.p8_scale_sandwich:
+            from b12x.moe._shared.kernels.p8_h128_fc1 import P8H128FC1Kernel
+            self.materialized_phase1_kernel = P8H128FC1Kernel(
+                full_coupled=self.p8_full_coupled,
+                trellis_bits=trellis_bits,
+            )
+        elif self.p8_fc1_tile_n != 128:
+            from b12x.moe._shared.kernels.p8_narrow_fc1 import P8NarrowFC1Kernel
+            self.materialized_phase1_kernel = P8NarrowFC1Kernel(
+                self.p8_fc1_tile_n, trellis_bits=trellis_bits
+            )
+        if self.p8_small_m and self.p8_scale_sandwich:
+            # Constructor invariant for the exact M1 boundary.  Keep this
+            # fail-closed because falling back to the monolithic FC1 changes
+            # the quantization transform while still producing finite output.
+            if not self.external_materialized_fc1 or not isinstance(
+                self.materialized_phase1_kernel, P8H128FC1Kernel
+            ):
+                raise AssertionError(
+                    "P8 M1 scale sandwich requires external P8H128FC1Kernel"
+                )
         if self.w4a8_repacked and quant_recipe not in ("w4a8_mx", "w4a8_trellis"):
             raise ValueError(
                 "repacked W4A8 weights are only valid for w4a8_mx or w4a8_trellis"
@@ -918,7 +1353,7 @@ class MoEDynamicKernelBackend:
                 quant_recipe == "w4a8_mx"
                 or (
                     quant_recipe == "w4a8_trellis"
-                    and mma_tiler_mn in {(64, 128), (128, 128)}
+                    and (mma_tiler_mn in {(64, 128), (128, 128)} or self.p8_small_m or self.p8_grouped_m16)
                 )
             )
             and mma_tiler_mn in {(16, 128), (32, 128), (64, 128), (128, 128)}
@@ -932,13 +1367,14 @@ class MoEDynamicKernelBackend:
             (
                 quant_recipe == "nvfp4"
                 or (self.w4a8_repacked and quant_recipe == "w4a8_mx")
+                or self.p8_small_m
             )
             and work_source != _WORK_SOURCE_READY_QUEUE
             and (
                 not self.materialize_intermediate
                 or (
                     self.w4a8_repacked
-                    and quant_recipe == "w4a8_mx"
+                    and (quant_recipe == "w4a8_mx" or self.p8_small_m)
                     and mma_tiler_mn == (16, 128)
                 )
             )
@@ -2141,6 +2577,139 @@ class MoEDynamicKernelBackend:
             )
 
     @cute.jit
+    def _store_p8_full_coupled_input_row(
+        self,
+        a_input: cute.Tensor,
+        packed_a_storage: cute.Tensor,
+        scale_storage: cute.Tensor,
+        scale_component: cute.Tensor,
+        token_idx: Int32,
+        warp_partition: Int32,
+        lane: Int32,
+        mx_blocks_per_row: Int32,
+    ):
+        """Materialize one token's exact H512*suh->H128 P8 input.
+
+        Each of the two producer warps owns alternating H512 units.  A unit is
+        complete in one warp, so neither normalized H128 nor the outer H4
+        crosses a CTA/warp boundary.  FP32 is retained from H512 through signed
+        suh and H128 until the E4M3/UE8M0/32 quantizer.
+        """
+
+        # A scalar CuTe coordinate on rank-2 input is colexicographic, not
+        # a row-major storage offset. Use explicit token/channel coordinates.
+        h512 = warp_partition
+        while h512 < mx_blocks_per_row // Int32(16):
+            quarters = tuple(
+                cute.make_rmem_tensor((4,), cutlass.Float32)
+                for _quarter in range(4)
+            )
+            for quarter in cutlass.range_constexpr(4):
+                col = (
+                    h512 * Int32(512)
+                    + Int32(quarter * 128)
+                    + lane * Int32(4)
+                )
+                quarters[quarter][0] = cutlass.Float16(
+                    a_input[token_idx, col].to(cutlass.Float32)
+                ).to(cutlass.Float32)
+                quarters[quarter][1] = cutlass.Float16(
+                    a_input[token_idx, col + Int32(1)].to(cutlass.Float32)
+                ).to(cutlass.Float32)
+                quarters[quarter][2] = cutlass.Float16(
+                    a_input[token_idx, col + Int32(2)].to(cutlass.Float32)
+                ).to(cutlass.Float32)
+                quarters[quarter][3] = cutlass.Float16(
+                    a_input[token_idx, col + Int32(3)].to(cutlass.Float32)
+                ).to(cutlass.Float32)
+                q0, q1, q2, q3 = _p8_had128_quad_unnormalized(
+                    quarters[quarter][0],
+                    quarters[quarter][1],
+                    quarters[quarter][2],
+                    quarters[quarter][3],
+                    lane,
+                )
+                quarters[quarter][0] = q0
+                quarters[quarter][1] = q1
+                quarters[quarter][2] = q2
+                quarters[quarter][3] = q3
+            for component in cutlass.range_constexpr(4):
+                x0 = quarters[0][component]
+                x1 = quarters[1][component]
+                x2 = quarters[2][component]
+                x3 = quarters[3][component]
+                y0, y1, y2, y3 = _p8_h512_mix_reference_order(
+                    x0, x1, x2, x3
+                )
+                quarters[0][component] = y0
+                quarters[1][component] = y1
+                quarters[2][component] = y2
+                quarters[3][component] = y3
+            for quarter in cutlass.range_constexpr(4):
+                output_col = (
+                    h512 * Int32(512)
+                    + Int32(quarter * 128)
+                    + lane * Int32(4)
+                )
+                h0 = _p8_mul_rn_f32(
+                    quarters[quarter][0],
+                    scale_component[output_col].to(cutlass.Float32),
+                )
+                h1 = _p8_mul_rn_f32(
+                    quarters[quarter][1],
+                    scale_component[output_col + Int32(1)].to(cutlass.Float32),
+                )
+                h2 = _p8_mul_rn_f32(
+                    quarters[quarter][2],
+                    scale_component[output_col + Int32(2)].to(cutlass.Float32),
+                )
+                h3 = _p8_mul_rn_f32(
+                    quarters[quarter][3],
+                    scale_component[output_col + Int32(3)].to(cutlass.Float32),
+                )
+                h0, h1, h2, h3 = _p8_had128_quad_reference_order(
+                    h0, h1, h2, h3, lane
+                )
+                group = lane >> Int32(3)
+                values = cute.make_rmem_tensor((32,), cutlass.Float32)
+                block_max = cutlass.Float32(0.0)
+                for elem in cutlass.range_constexpr(32):
+                    component = elem & Int32(3)
+                    owned = h0
+                    if component == Int32(1):
+                        owned = h1
+                    elif component == Int32(2):
+                        owned = h2
+                    elif component == Int32(3):
+                        owned = h3
+                    source_lane = group * Int32(8) + elem // Int32(4)
+                    value = cute.arch.shuffle_sync(owned, source_lane)
+                    values[elem] = value
+                    block_max = fmax_f32(block_max, fabs_f32(value))
+                payload, scale_byte = quantize_block_fp8_mx(
+                    _w4a8_trellis_permute_k32(values), block_max
+                )
+                if (lane & Int32(7)) == Int32(0):
+                    block = h512 * Int32(16) + Int32(quarter * 4) + group
+                    block_start = block * Int32(32)
+                    payload_row = token_idx * Int32(a_input.shape[1])
+                    for pair in cutlass.range_constexpr(4):
+                        packed64 = (
+                            Uint64(payload[pair * 2 + 1]) << Uint64(32)
+                        ) | Uint64(payload[pair * 2])
+                        st_global_u64(
+                            get_ptr_as_int64(
+                                packed_a_storage,
+                                payload_row + block_start + Int32(pair * 8),
+                            ),
+                            packed64,
+                        )
+                    scale_storage[token_idx * mx_blocks_per_row + block] = Uint8(
+                        scale_byte & Uint32(0xFF)
+                    )
+            h512 += Int32(self.input_warps_per_token)
+
+    @cute.jit
     def __call__(
         self,
         a_input: cute.Tensor,  # [num_tokens, K] bf16
@@ -2196,7 +2765,7 @@ class MoEDynamicKernelBackend:
         down_rp: cute.Tensor | None = None,  # flat repacked u32 B
         down_sfb_rp: cute.Tensor | None = None,  # flat repacked u32 SFB
         trellis_lut: cute.Tensor | None = None,  # 4 KiB T12 staircase (u8)
-        trellis_rotations: cute.Tensor | None = None,  # [E*3I] fp16
+        trellis_rotations: cute.Tensor | None = None,  # transform/scale fp16 carrier
     ):
         self.a_dtype = packed_a.element_type
         self.b_dtype = b_w13.element_type
@@ -2383,6 +2952,9 @@ class MoEDynamicKernelBackend:
                 self.tile_shape_mnk[1]
             )
         launch_params = DynamicLaunchParams(row_counts, gate_tile_cnt)
+        # CuTe exposes these tensor extents as staged values here, so Python
+        # assertions do not lower. The host wrapper rejects every non-M1,
+        # non-E288/H4096/I512 use before this opt-in kernel is built.
         if cutlass.const_expr(self.is_w4a8):
             assert sfb_w13_mx is not None and sfb_down_mx is not None, (
                 "w4a8 recipes require sfb_w13_mx and sfb_down_mx"
@@ -2424,6 +2996,10 @@ class MoEDynamicKernelBackend:
                 "w4a8_trellis requires the flat trellis payload tensors "
                 "(via w13_rp/down_rp) and the T12 staircase table"
             )
+            if cutlass.const_expr(self.trellis_scaled):
+                assert w13_sfb_rp is not None and down_sfb_rp is not None, (
+                    "scaled w4a8_trellis requires repacked UE8M0 SFB tensors"
+                )
         elif cutlass.const_expr(self.w4a8_repacked):
             assert (
                 w13_rp is not None
@@ -2532,6 +3108,12 @@ class MoEDynamicKernelBackend:
             stream=stream,
         )
         if cutlass.const_expr(self.external_materialized_fc1):
+            phase1_experts = task_expert
+            # Every direct M1 owner, including N128 full coupling, consumes
+            # original route ids. Phase0 does not populate grouped task_expert
+            # on this path. Dense prefill still consumes grouped task metadata.
+            if cutlass.const_expr(self.p8_small_m or self.p8_fc1_tile_n != 128):
+                phase1_experts = topk_ids
             self.materialized_phase1_kernel(
                 packed_a_storage,
                 scale_storage,
@@ -2539,7 +3121,7 @@ class MoEDynamicKernelBackend:
                 w13_sfb_rp,
                 intermediate_u32,
                 token_map,
-                task_expert,
+                phase1_experts,
                 task_valid_rows,
                 expert_tile_base,
                 alpha,
@@ -2553,24 +3135,50 @@ class MoEDynamicKernelBackend:
                 stream,
             )
         if cutlass.const_expr(self.external_materialized_fc2):
-            self.materialized_phase2_kernel(
-                intermediate_u32,
-                down_rp,
-                down_sfb_rp,
-                scatter_output,
-                token_map,
-                token_weights,
-                task_expert,
-                task_valid_rows,
-                expert_tile_base,
-                down_alpha,
-                global_scale,
-                trellis_lut,
-                gate_tile_cnt,
-                Int32(b_down.shape[0]) // Int32(256),
-                max_active_clusters,
-                stream,
-            )
+            # M1 consumes original route-order ids; dense FC2 consumes grouped
+            # task metadata. Neither path reads routing state back on the host.
+            phase2_experts = task_expert
+            if cutlass.const_expr(self.p8_small_m):
+                phase2_experts = topk_ids
+            if cutlass.const_expr(self.p8_small_m or self.p8_full_coupled):
+                self.materialized_phase2_kernel(
+                    intermediate_u32,
+                    down_rp,
+                    down_sfb_rp,
+                    scatter_output,
+                    token_map,
+                    token_weights,
+                    phase2_experts,
+                    task_valid_rows,
+                    expert_tile_base,
+                    down_alpha,
+                    global_scale,
+                    trellis_lut,
+                    trellis_rotations,
+                    gate_tile_cnt,
+                    Int32(b_down.shape[0]) // Int32(256),
+                    max_active_clusters,
+                    stream,
+                )
+            else:
+                self.materialized_phase2_kernel(
+                    intermediate_u32,
+                    down_rp,
+                    down_sfb_rp,
+                    scatter_output,
+                    token_map,
+                    token_weights,
+                    phase2_experts,
+                    task_valid_rows,
+                    expert_tile_base,
+                    down_alpha,
+                    global_scale,
+                    trellis_lut,
+                    gate_tile_cnt,
+                    Int32(b_down.shape[0]) // Int32(256),
+                    max_active_clusters,
+                    stream,
+                )
 
     @cute.kernel
     def kernel(
@@ -2769,7 +3377,10 @@ class MoEDynamicKernelBackend:
             ]
             trellis_lut_smem: cute.struct.Align[
                 cute.struct.MemRange[
-                    cutlass.Uint8, 4096 if self.w4a8_trellis else 16
+                    cutlass.Uint8,
+                    4096
+                    if self.w4a8_trellis and self.trellis_codebook != "mcg"
+                    else 16,
                 ],
                 16,
             ]
@@ -2881,7 +3492,9 @@ class MoEDynamicKernelBackend:
             )
         sfa_base_addr = ctrl_base_addr + Int32(Storage._offsets["sSFA"])
         reduce_scratch_addr = ctrl_base_addr + Int32(Storage._offsets["reduce_scratch"])
-        if cutlass.const_expr(self.w4a8_trellis):
+        if cutlass.const_expr(
+            self.w4a8_trellis and self.trellis_codebook != "mcg"
+        ):
             # Stage the 4 KiB T12 staircase once; every later decode gathers
             # from shared memory. The phase-0 grid barrier orders the copy
             # ahead of any consumer decode.
@@ -3055,44 +3668,286 @@ class MoEDynamicKernelBackend:
             )
 
             if m1_has_active_route > Int32(0):
-                m1_blk_idx = flat_tid
-                while m1_blk_idx < mx_blocks_per_row:
-                    m1_block_start = m1_blk_idx * Int32(32)
-                    m1_values, m1_block_max = _load_bf16x32_to_f32(
-                        a_input,
-                        m1_block_start,
-                    )
-                    if cutlass.const_expr(self.w4a8_trellis):
+                if cutlass.const_expr(self.p8_full_coupled):
+                    # Full Luke/QSRT input boundary. One warp owns all four
+                    # H128 quarters of a complete H512 block, so the outer
+                    # normalized H4 coupling happens in registers with no
+                    # cross-CTA dependency. The order is exactly:
+                    # BF16 -> FP16 -> H512 -> signed suh -> H128 (FP32),
+                    # followed by K32 amax/E4M3/UE8M0 packing.
+                    m1_warp = flat_tid >> Int32(5)
+                    m1_warp_stride = flat_stride >> Int32(5)
+                    m1_h512 = m1_warp
+                    while m1_h512 < num_tokens * (mx_blocks_per_row // Int32(16)):
+                        # One H512 unit per input row. Preserve the M1 order
+                        # while permitting multiple direct-route tokens.
+                        p8_input_row = m1_h512 // (mx_blocks_per_row // Int32(16))
+                        p8_local_h512 = m1_h512 % (mx_blocks_per_row // Int32(16))
+                        quarters = tuple(
+                            cute.make_rmem_tensor((4,), cutlass.Float32)
+                            for _quarter in range(4)
+                        )
+                        for quarter in cutlass.range_constexpr(4):
+                            m1_col = (
+                                p8_local_h512 * Int32(512)
+                                + Int32(quarter * 128)
+                                + m1_lane_id * Int32(4)
+                            )
+                            quarters[quarter][0] = cutlass.Float16(
+                                a_input[p8_input_row, m1_col].to(cutlass.Float32)
+                            ).to(cutlass.Float32)
+                            quarters[quarter][1] = cutlass.Float16(
+                                a_input[p8_input_row, m1_col + Int32(1)].to(cutlass.Float32)
+                            ).to(cutlass.Float32)
+                            quarters[quarter][2] = cutlass.Float16(
+                                a_input[p8_input_row, m1_col + Int32(2)].to(cutlass.Float32)
+                            ).to(cutlass.Float32)
+                            quarters[quarter][3] = cutlass.Float16(
+                                a_input[p8_input_row, m1_col + Int32(3)].to(cutlass.Float32)
+                            ).to(cutlass.Float32)
+                            q0, q1, q2, q3 = _p8_had128_quad_unnormalized(
+                                quarters[quarter][0], quarters[quarter][1],
+                                quarters[quarter][2], quarters[quarter][3],
+                                m1_lane_id,
+                            )
+                            quarters[quarter][0] = q0
+                            quarters[quarter][1] = q1
+                            quarters[quarter][2] = q2
+                            quarters[quarter][3] = q3
+                        for component in cutlass.range_constexpr(4):
+                            x0 = quarters[0][component]
+                            x1 = quarters[1][component]
+                            x2 = quarters[2][component]
+                            x3 = quarters[3][component]
+                            y0, y1, y2, y3 = _p8_h512_mix_reference_order(
+                                x0, x1, x2, x3
+                            )
+                            quarters[0][component] = y0
+                            quarters[1][component] = y1
+                            quarters[2][component] = y2
+                            quarters[3][component] = y3
+                        for quarter in cutlass.range_constexpr(4):
+                            output_col = (
+                                p8_local_h512 * Int32(512)
+                                + Int32(quarter * 128)
+                                + m1_lane_id * Int32(4)
+                            )
+                            h0 = _p8_mul_rn_f32(
+                                quarters[quarter][0],
+                                trellis_rotations[output_col].to(cutlass.Float32),
+                            )
+                            h1 = _p8_mul_rn_f32(
+                                quarters[quarter][1],
+                                trellis_rotations[output_col + Int32(1)].to(cutlass.Float32),
+                            )
+                            h2 = _p8_mul_rn_f32(
+                                quarters[quarter][2],
+                                trellis_rotations[output_col + Int32(2)].to(cutlass.Float32),
+                            )
+                            h3 = _p8_mul_rn_f32(
+                                quarters[quarter][3],
+                                trellis_rotations[output_col + Int32(3)].to(cutlass.Float32),
+                            )
+                            h0, h1, h2, h3 = _p8_had128_quad_reference_order(
+                                h0, h1, h2, h3, m1_lane_id
+                            )
+                            m1_group = m1_lane_id >> Int32(3)
+                            m1_values = cute.make_rmem_tensor((32,), cutlass.Float32)
+                            m1_block_max = cutlass.Float32(0.0)
+                            for m1_elem in cutlass.range_constexpr(32):
+                                m1_component = m1_elem & Int32(3)
+                                m1_own = h0
+                                if m1_component == Int32(1):
+                                    m1_own = h1
+                                elif m1_component == Int32(2):
+                                    m1_own = h2
+                                elif m1_component == Int32(3):
+                                    m1_own = h3
+                                m1_source_lane = m1_group * Int32(8) + m1_elem // Int32(4)
+                                m1_value = cute.arch.shuffle_sync(m1_own, m1_source_lane)
+                                m1_values[m1_elem] = m1_value
+                                m1_block_max = fmax_f32(m1_block_max, fabs_f32(m1_value))
+                            m1_payload, m1_scale_byte = quantize_block_fp8_mx(
+                                _w4a8_trellis_permute_k32(m1_values), m1_block_max
+                            )
+                            if (m1_lane_id & Int32(7)) == Int32(0):
+                                m1_blk_idx = m1_h512 * Int32(16) + Int32(quarter * 4) + m1_group
+                                if cutlass.const_expr(self.p8_input_prequant_diagnostic):
+                                    # Exact diagnostic contract, logical order:
+                                    #   f32[0:32]   raw K32 block 40
+                                    #   f32[32:64]  block 40 * quantizer inv_scale
+                                    #   f32[64:96]  raw K32 block 62
+                                    #   f32[96:128] block 62 * quantizer inv_scale
+                                    # Capture happens after quantization so the
+                                    # observed payload arithmetic is not changed.
+                                    assert trellis_lut is not None
+                                    if (
+                                        m1_blk_idx == Int32(40)
+                                        or m1_blk_idx == Int32(62)
+                                    ):
+                                        trace_base = Int32(0)
+                                        if m1_blk_idx == Int32(62):
+                                            trace_base = Int32(64)
+                                        trace_inv_scale = ue8m0_to_output_scale(
+                                            m1_scale_byte
+                                        )
+                                        for trace_elem in cutlass.range_constexpr(32):
+                                            st_global_f32(
+                                                get_ptr_as_int64(
+                                                    trellis_lut,
+                                                    (trace_base + Int32(trace_elem))
+                                                    * Int32(4),
+                                                ),
+                                                m1_values[trace_elem],
+                                            )
+                                            st_global_f32(
+                                                get_ptr_as_int64(
+                                                    trellis_lut,
+                                                    (
+                                                        trace_base
+                                                        + Int32(32 + trace_elem)
+                                                    )
+                                                    * Int32(4),
+                                                ),
+                                                m1_values[trace_elem]
+                                                * trace_inv_scale,
+                                            )
+                                m1_block_start = m1_blk_idx * Int32(32)
+                                for pair in cutlass.range_constexpr(4):
+                                    packed64 = (
+                                        Uint64(m1_payload[pair * 2 + 1]) << Uint64(32)
+                                    ) | Uint64(m1_payload[pair * 2])
+                                    st_global_u64(
+                                        get_ptr_as_int64(packed_a_storage, m1_block_start + Int32(pair * 8)),
+                                        packed64,
+                                    )
+                                scale_storage[m1_blk_idx] = Uint8(m1_scale_byte & Uint32(0xFF))
+                        m1_h512 += m1_warp_stride
+                elif cutlass.const_expr(self.p8_scale_sandwich):
+                    # One warp owns one complete H128 input block.  Each lane
+                    # loads four adjacent BF16 channels, applies signed suh in
+                    # FP32, rounds to FP16, then participates in normalized
+                    # H128.  K32 amax is therefore computed only from the final
+                    # transformed values, never from the pre-suh input.
+                    m1_warp = flat_tid >> Int32(5)
+                    m1_warp_stride = flat_stride >> Int32(5)
+                    m1_h128 = m1_warp
+                    while m1_h128 < mx_blocks_per_row // Int32(4):
+                        m1_col = m1_h128 * Int32(128) + m1_lane_id * Int32(4)
+                        h0 = _p8_scale_input_before_h128(
+                            a_input[m1_col].to(cutlass.Float32),
+                            trellis_rotations,
+                            m1_col,
+                        )
+                        h1 = _p8_scale_input_before_h128(
+                            a_input[m1_col + Int32(1)].to(cutlass.Float32),
+                            trellis_rotations,
+                            m1_col + Int32(1),
+                        )
+                        h2 = _p8_scale_input_before_h128(
+                            a_input[m1_col + Int32(2)].to(cutlass.Float32),
+                            trellis_rotations,
+                            m1_col + Int32(2),
+                        )
+                        h3 = _p8_scale_input_before_h128(
+                            a_input[m1_col + Int32(3)].to(cutlass.Float32),
+                            trellis_rotations,
+                            m1_col + Int32(3),
+                        )
+                        h0, h1, h2, h3 = _w4a8_had128_quad(
+                            h0, h1, h2, h3, m1_lane_id
+                        )
+                        m1_group = m1_lane_id >> Int32(3)
+                        m1_values = cute.make_rmem_tensor((32,), cutlass.Float32)
+                        m1_block_max = cutlass.Float32(0.0)
+                        for m1_elem in cutlass.range_constexpr(32):
+                            m1_component = m1_elem & Int32(3)
+                            m1_own = h0
+                            if m1_component == Int32(1):
+                                m1_own = h1
+                            elif m1_component == Int32(2):
+                                m1_own = h2
+                            elif m1_component == Int32(3):
+                                m1_own = h3
+                            m1_source_lane = (
+                                m1_group * Int32(8) + m1_elem // Int32(4)
+                            )
+                            m1_value = cute.arch.shuffle_sync(
+                                m1_own, m1_source_lane
+                            )
+                            m1_values[m1_elem] = m1_value
+                            m1_block_max = fmax_f32(
+                                m1_block_max, fabs_f32(m1_value)
+                            )
                         m1_payload, m1_mx_scale_byte = quantize_block_fp8_mx(
                             _w4a8_trellis_permute_k32(m1_values),
                             m1_block_max,
                         )
-                    else:
-                        m1_payload, m1_mx_scale_byte = quantize_block_fp8_mx(
-                            m1_values,
-                            m1_block_max,
+                        if (m1_lane_id & Int32(7)) == Int32(0):
+                            m1_blk_idx = m1_h128 * Int32(4) + m1_group
+                            m1_block_start = m1_blk_idx * Int32(32)
+                            for m1_payload_pair in cutlass.range_constexpr(4):
+                                m1_packed64 = (
+                                    Uint64(m1_payload[m1_payload_pair * 2 + 1])
+                                    << Uint64(32)
+                                ) | Uint64(m1_payload[m1_payload_pair * 2])
+                                st_global_u64(
+                                    get_ptr_as_int64(
+                                        packed_a_storage,
+                                        m1_block_start
+                                        + Int32(m1_payload_pair * 8),
+                                    ),
+                                    m1_packed64,
+                                )
+                            scale_storage[m1_blk_idx] = Uint8(
+                                m1_mx_scale_byte & Uint32(0xFF)
+                            )
+                        m1_h128 += m1_warp_stride
+                else:
+                    m1_blk_idx = flat_tid
+                    while m1_blk_idx < mx_blocks_per_row:
+                        m1_block_start = m1_blk_idx * Int32(32)
+                        m1_values, m1_block_max = _load_bf16x32_to_f32(
+                            a_input,
+                            m1_block_start,
                         )
-                    for m1_payload_pair in cutlass.range_constexpr(4):
-                        m1_packed64 = (
-                            Uint64(m1_payload[m1_payload_pair * 2 + 1]) << Uint64(32)
-                        ) | Uint64(m1_payload[m1_payload_pair * 2])
-                        st_global_u64(
-                            get_ptr_as_int64(
-                                packed_a_storage,
-                                m1_block_start + Int32(m1_payload_pair * 8),
-                            ),
-                            m1_packed64,
+                        if cutlass.const_expr(self.w4a8_trellis):
+                            m1_payload, m1_mx_scale_byte = quantize_block_fp8_mx(
+                                _w4a8_trellis_permute_k32(m1_values),
+                                m1_block_max,
+                            )
+                        else:
+                            m1_payload, m1_mx_scale_byte = quantize_block_fp8_mx(
+                                m1_values,
+                                m1_block_max,
+                            )
+                        for m1_payload_pair in cutlass.range_constexpr(4):
+                            m1_packed64 = (
+                                Uint64(m1_payload[m1_payload_pair * 2 + 1]) << Uint64(32)
+                            ) | Uint64(m1_payload[m1_payload_pair * 2])
+                            st_global_u64(
+                                get_ptr_as_int64(
+                                    packed_a_storage,
+                                    m1_block_start + Int32(m1_payload_pair * 8),
+                                ),
+                                m1_packed64,
+                            )
+                        scale_storage[m1_blk_idx] = Uint8(
+                            m1_mx_scale_byte & Uint32(0xFF)
                         )
-                    scale_storage[m1_blk_idx] = Uint8(
-                        m1_mx_scale_byte & Uint32(0xFF)
-                    )
-                    m1_blk_idx += flat_stride
+                        m1_blk_idx += flat_stride
 
             if flat_tid < total_pairs:
                 m1_slot_expert_id = topk_ids[flat_tid].to(Int32)
                 if m1_slot_expert_id >= Int32(0) and m1_slot_expert_id < num_experts:
                     m1_physical_row = flat_tid * Int32(self.tile_shape_mnk[0])
-                    token_map[m1_physical_row] = Int32(0)
+                    if cutlass.const_expr(self.deterministic_output):
+                        # FC1 divides a route index by top-k to gather its
+                        # input token; FC2 needs distinct route output slots.
+                        # Storing the token here would divide twice at M>1.
+                        token_map[m1_physical_row] = flat_tid
+                    else:
+                        token_map[m1_physical_row] = flat_tid // num_topk
                     token_weights[m1_physical_row] = topk_weights[flat_tid].to(
                         cutlass.Float32
                     )
@@ -3291,7 +4146,18 @@ class MoEDynamicKernelBackend:
                                 # route-expanded path fans it out to each route.
                                 # That path keeps only physical rows in rmem here to
                                 # stay below the two-CTA register-residency limit.
-                                if num_topk == Int32(8):
+                                if cutlass.const_expr(self.p8_full_coupled):
+                                    self._store_p8_full_coupled_input_row(
+                                        a_input,
+                                        packed_a_storage,
+                                        scale_storage,
+                                        trellis_rotations,
+                                        token_idx,
+                                        token_partition,
+                                        lane_id,
+                                        mx_blocks_per_row,
+                                    )
+                                elif num_topk == Int32(8):
                                     for cache_slot in cutlass.range_constexpr(8):
                                         slot = route_slot_base + Int32(cache_slot)
                                         shared_route_phys_rows[cache_slot] = _ld_shared_i32(
@@ -5458,9 +6324,11 @@ class MoEDynamicKernelBackend:
                                     else:
                                         n_in = w4a8_n8_thread_base + Int32(_nt * 32)
                                     n_in_arr[_nt] = n_in
-                                    if cutlass.const_expr(self.w4a8_trellis):
-                                        # Trellis decode emits fully-scaled
-                                        # E4M3; UE8M0 identity word.
+                                    if cutlass.const_expr(
+                                        self.w4a8_trellis and not self.trellis_scaled
+                                    ):
+                                        # Legacy trellis payloads decode a
+                                        # fully-scaled E4M3 value.
                                         sfb_words[_nt] = Uint32(0x7F7F7F7F)
                                         if cutlass.const_expr(self.w4a8_fused):
                                             sfb_words_u[_nt] = Uint32(0x7F7F7F7F)
@@ -5530,27 +6398,45 @@ class MoEDynamicKernelBackend:
                                             tr_base0 = (
                                                 Int32(_kb * 16) + n16_local
                                             ) * Int32(8 * self.trellis_bits)
-                                            blo, bhi = _w4a8_trellis_pair_words(
-                                                b_buf,
-                                                Int32(lane_id),
-                                                tr_base0,
-                                                tr_base0
-                                                + Int32(64 * self.trellis_bits),
-                                                tr_ia,
-                                                tr_ib,
-                                                tr_s2,
-                                                tr_n_high,
-                                                self.trellis_bits,
-                                                trellis_lut_addr,
-                                            )
+                                            if cutlass.const_expr(
+                                                self.trellis_codebook == "mcg"
+                                            ):
+                                                blo, bhi = _w4a8_trellis_pair_words_mcg(
+                                                    b_buf, Int32(lane_id), tr_base0,
+                                                    tr_base0 + Int32(64 * self.trellis_bits),
+                                                    tr_ia, tr_ib, tr_s2, tr_n_high,
+                                                    self.trellis_bits,
+                                                )
+                                            else:
+                                                blo, bhi = _w4a8_trellis_pair_words_sqg(
+                                                    b_buf, Int32(lane_id), tr_base0,
+                                                    tr_base0 + Int32(64 * self.trellis_bits),
+                                                    tr_ia, tr_ib, tr_s2, tr_n_high,
+                                                    self.trellis_bits, trellis_lut_addr,
+                                                )
                                             b_lo[_nt] = blo
                                             b_hi[_nt] = bhi
                                             if cutlass.const_expr(self.w4a8_fused):
                                                 tr_base0_u = tr_base0 + Int32(
                                                     512 * self.trellis_bits
                                                 )
-                                                blo_u, bhi_u = (
-                                                    _w4a8_trellis_pair_words(
+                                                if cutlass.const_expr(
+                                                    self.trellis_codebook == "mcg"
+                                                ):
+                                                    blo_u, bhi_u = _w4a8_trellis_pair_words_mcg(
+                                                        b_buf,
+                                                        Int32(lane_id),
+                                                        tr_base0_u,
+                                                        tr_base0_u
+                                                        + Int32(64 * self.trellis_bits),
+                                                        tr_ia,
+                                                        tr_ib,
+                                                        tr_s2,
+                                                        tr_n_high,
+                                                        self.trellis_bits,
+                                                    )
+                                                else:
+                                                    blo_u, bhi_u = _w4a8_trellis_pair_words_sqg(
                                                         b_buf,
                                                         Int32(lane_id),
                                                         tr_base0_u,
@@ -5565,7 +6451,6 @@ class MoEDynamicKernelBackend:
                                                         self.trellis_bits,
                                                         trellis_lut_addr,
                                                     )
-                                                )
                                                 b_lo_u[_nt] = blo_u
                                                 b_hi_u[_nt] = bhi_u
                                     elif cutlass.const_expr(self.w4a8_repacked):
@@ -5871,12 +6756,15 @@ class MoEDynamicKernelBackend:
                                             (None, mma_m_in_epi, mma_n_in_epi)
                                         ]
                                         gate_slice = tRS_rGate[(None, mma_m, mma_n)]
-                                        if cutlass.const_expr(self.w4a8_trellis):
-                                            # Trellis: stage the raw (alpha-
-                                            # scaled) gate slice; the rotation
-                                            # passes below apply H128, the
-                                            # per-expert rotations, and the
-                                            # activation from sC.
+                                        if cutlass.const_expr(
+                                            self.w4a8_trellis
+                                            and not self.trellis_identity_boundary
+                                        ):
+                                            # Rotated trellis boundaries stage
+                                            # the raw alpha-scaled gate. The
+                                            # identity boundary instead takes
+                                            # the ordinary gated-activation
+                                            # branch below.
                                             for elem_idx in cutlass.range_constexpr(
                                                 cute.size(tRS_rD_slice)
                                             ):
@@ -5922,7 +6810,9 @@ class MoEDynamicKernelBackend:
                             if epi_rows < Int32(0):
                                 epi_rows = Int32(0)
                             if cutlass.const_expr(
-                                self.w4a8_trellis and not self.trellis_coupled
+                                self.w4a8_trellis
+                                and not self.trellis_identity_boundary
+                                and not self.trellis_coupled
                             ):
                                 # Trellis activation boundary through sC:
                                 # ig = rot_g * H128(g); then restage up,
@@ -6090,7 +6980,9 @@ class MoEDynamicKernelBackend:
                                 cute.arch.fence_proxy("async.shared", space="cta")
                                 self.epilog_sync_barrier.arrive_and_wait()
                             if cutlass.const_expr(
-                                self.w4a8_trellis and self.trellis_coupled
+                                self.w4a8_trellis
+                                and not self.trellis_identity_boundary
+                                and self.trellis_coupled
                             ):
                                 # Coupled activation boundary: the slice's raw
                                 # gate sits in sC[epi_buffer]; restage raw up
@@ -7080,6 +7972,69 @@ class MoEDynamicKernelBackend:
                                 epi_rows = Int32(self.epi_tile[0])
                             if epi_rows < Int32(0):
                                 epi_rows = Int32(0)
+                            if cutlass.const_expr(self.mxfp6_h16_all):
+                                # Exact Qwen-style R_mid: apply normalized
+                                # Sylvester H16 independently to every fixed
+                                # 16-channel block of the BF16 post-SwiGLU
+                                # intermediate before its MXFP8 quantization.
+                                # One MMA thread owns a whole block, so all 16
+                                # values stay in registers through the four
+                                # butterfly stages and there is no cross-warp
+                                # reduction or lane permutation.
+                                h16_blocks_per_row = Int32(
+                                    self.tile_shape_mnk[2] // 16
+                                )
+                                h16_idx = Int32(tidx)
+                                h16_total = epi_rows * h16_blocks_per_row
+                                while h16_idx < h16_total:
+                                    h16_row = h16_idx // h16_blocks_per_row
+                                    h16_block = (
+                                        h16_idx - h16_row * h16_blocks_per_row
+                                    )
+                                    h16_col = h16_block * Int32(16)
+                                    h16_values = cute.make_rmem_tensor(
+                                        (16,), cutlass.Float32
+                                    )
+                                    for h16_element in cutlass.range_constexpr(16):
+                                        h16_values[h16_element] = cutlass.Float32(
+                                            sC[
+                                                h16_row,
+                                                h16_col + Int32(h16_element),
+                                                epi_buffer,
+                                            ]
+                                        )
+                                    for h16_stage in cutlass.range_constexpr(4):
+                                        h16_stride = 1 << h16_stage
+                                        for h16_group in cutlass.range_constexpr(
+                                            16 // (2 * h16_stride)
+                                        ):
+                                            for h16_offset in cutlass.range_constexpr(
+                                                h16_stride
+                                            ):
+                                                h16_left = (
+                                                    h16_group * 2 * h16_stride
+                                                    + h16_offset
+                                                )
+                                                h16_right = h16_left + h16_stride
+                                                h16_a = h16_values[h16_left]
+                                                h16_b = h16_values[h16_right]
+                                                h16_values[h16_left] = h16_a + h16_b
+                                                h16_values[h16_right] = h16_a - h16_b
+                                    for h16_element in cutlass.range_constexpr(16):
+                                        sC[
+                                            h16_row,
+                                            h16_col + Int32(h16_element),
+                                            epi_buffer,
+                                        ] = cutlass.BFloat16(
+                                            h16_values[h16_element]
+                                            * cutlass.Float32(0.25)
+                                        )
+                                    h16_idx += Int32(
+                                        self.num_mma_warps
+                                        * self.num_threads_per_warp
+                                    )
+                                cute.arch.fence_proxy("async.shared", space="cta")
+                                self.epilog_sync_barrier.arrive_and_wait()
                             if cutlass.const_expr(self.is_w6a8):
                                 # Zero the FP6/FP8 intermediate SFA + A-code
                                 # smem before the FC2 requant store. The store
@@ -7579,7 +8534,9 @@ class MoEDynamicKernelBackend:
                                 for _ot in cutlass.range_constexpr(
                                     self.w4a8_fc2_compute_width
                                 ):
-                                    if cutlass.const_expr(self.w4a8_trellis):
+                                    if cutlass.const_expr(
+                                        self.w4a8_trellis and not self.trellis_scaled
+                                    ):
                                         sfb_words2[_ot, _nt] = Uint32(0x7F7F7F7F)
                                     else:
                                         sfb_words2[_ot, _nt] = ld_shared_u32(
@@ -7622,19 +8579,22 @@ class MoEDynamicKernelBackend:
                                             ) + (
                                                 Int32(_kb * 16) + n16_local2
                                             ) * Int32(8 * self.trellis_bits)
-                                            blo, bhi = _w4a8_trellis_pair_words(
-                                                b_buf,
-                                                Int32(lane_id),
-                                                tr2_base0,
-                                                tr2_base0
-                                                + Int32(64 * self.trellis_bits),
-                                                tr_ia,
-                                                tr_ib,
-                                                tr_s2,
-                                                tr_n_high2,
-                                                self.trellis_bits,
-                                                trellis_lut_addr,
-                                            )
+                                            if cutlass.const_expr(
+                                                self.trellis_codebook == "mcg"
+                                            ):
+                                                blo, bhi = _w4a8_trellis_pair_words_mcg(
+                                                    b_buf, Int32(lane_id), tr2_base0,
+                                                    tr2_base0 + Int32(64 * self.trellis_bits),
+                                                    tr_ia, tr_ib, tr_s2, tr_n_high2,
+                                                    self.trellis_bits,
+                                                )
+                                            else:
+                                                blo, bhi = _w4a8_trellis_pair_words_sqg(
+                                                    b_buf, Int32(lane_id), tr2_base0,
+                                                    tr2_base0 + Int32(64 * self.trellis_bits),
+                                                    tr_ia, tr_ib, tr_s2, tr_n_high2,
+                                                    self.trellis_bits, trellis_lut_addr,
+                                                )
                                             b_lo[_ot, _nt] = blo
                                             b_hi[_ot, _nt] = bhi
                                 elif cutlass.const_expr(self.w4a8_repacked):
@@ -8317,6 +9277,23 @@ class MoEDynamicKernelBackend:
                                             + (par << Int32(2)),
                                             need,
                                         )
+                                    # B may be trellis-coded while its scale
+                                    # tile retains the ordinary W4A8 repack.
+                                    rp_nt = p_n_tile >> Int32(1)
+                                    rp_half = p_n_tile & Int32(1)
+                                    rp_tile = (
+                                        task_expert_idx
+                                        * Int32(b_w13_u32.shape[0] // 256)
+                                        + rp_nt
+                                    ) * Int32(w4a8_KT) + Int32(_pkt)
+                                    if cutlass.const_expr(self.w4a8_fused):
+                                        rp_ntu = pu_n_tile >> Int32(1)
+                                        rp_halfu = pu_n_tile & Int32(1)
+                                        rp_tileu = (
+                                            task_expert_idx
+                                            * Int32(b_w13_u32.shape[0] // 256)
+                                            + rp_ntu
+                                        ) * Int32(w4a8_KT) + Int32(_pkt)
                                     if cutlass.const_expr(self.w4a8_trellis):
                                         # Trellis payload is projection-major
                                         # [proj][E][K16][N16] window blocks
@@ -8382,13 +9359,6 @@ class MoEDynamicKernelBackend:
                                         w4a8_b_dst = (
                                             w4a8_sb0 + (w4a8_sb1 - w4a8_sb0) * par
                                         )
-                                        rp_nt = p_n_tile >> Int32(1)
-                                        rp_half = p_n_tile & Int32(1)
-                                        rp_tile = (
-                                            task_expert_idx
-                                            * Int32(b_w13_u32.shape[0] // 256)
-                                            + rp_nt
-                                        ) * Int32(w4a8_KT) + Int32(_pkt)
                                         _w4a8_stage_repacked_b_half(
                                             w13_rp,
                                             w4a8_b_dst,
@@ -8398,13 +9368,6 @@ class MoEDynamicKernelBackend:
                                             32,
                                         )
                                         if cutlass.const_expr(self.w4a8_fused):
-                                            rp_ntu = pu_n_tile >> Int32(1)
-                                            rp_halfu = pu_n_tile & Int32(1)
-                                            rp_tileu = (
-                                                task_expert_idx
-                                                * Int32(b_w13_u32.shape[0] // 256)
-                                                + rp_ntu
-                                            ) * Int32(w4a8_KT) + Int32(_pkt)
                                             _w4a8_stage_repacked_b_half(
                                                 w13_rp,
                                                 w4a8_b_dst + Int32(128 * 64),
@@ -8536,8 +9499,8 @@ class MoEDynamicKernelBackend:
                                         w4a8_sfb_dst = w4a8_sfbb + (par << Int32(10))
                                     else:
                                         w4a8_sfb_dst = w4a8_sfbb + (par << Int32(9))
-                                    # Trellis B is fully scaled E4M3 with an
-                                    # identity SFB word; no SFB staging.
+                                    # A scaled trellis carries the physical
+                                    # UE8M0/32 grids in the repacked SFB slots.
                                     if cutlass.const_expr(
                                         self.w4a8_repacked
                                         and not self.w4a8_trellis
@@ -8556,6 +9519,26 @@ class MoEDynamicKernelBackend:
                                                 w4a8_sfb_dst + Int32(512),
                                                 Int64(rp_tileu) * Int64(256),
                                                 rp_halfu,
+                                                Int32(lane_id),
+                                                32,
+                                            )
+                                    elif cutlass.const_expr(
+                                        self.w4a8_trellis and self.trellis_scaled
+                                    ):
+                                        _w4a8_stage_bytes4(
+                                            sfb_w13_mx,
+                                            w4a8_sfb_dst,
+                                            sfb_base_p + Int64(_pkt) * Int64(4),
+                                            Int32(sfb_row_p),
+                                            Int32(lane_id),
+                                            32,
+                                        )
+                                        if cutlass.const_expr(self.w4a8_fused):
+                                            _w4a8_stage_bytes4(
+                                                sfb_w13_mx,
+                                                w4a8_sfb_dst + Int32(512),
+                                                sfb_base_pu + Int64(_pkt) * Int64(4),
+                                                Int32(sfb_row_p),
                                                 Int32(lane_id),
                                                 32,
                                             )
@@ -8770,6 +9753,11 @@ class MoEDynamicKernelBackend:
                                         need2,
                                     )
                                 row_off_p = Int64(_pt) * Int64(128)
+                                rp_tile2 = (
+                                    task_expert_idx
+                                    * Int32(b_down_u32.shape[0] // 256)
+                                    + (_pt >> Int32(1))
+                                ) * gate_tile_cnt + cur_slice_p
                                 if cutlass.const_expr(self.w4a8_trellis):
                                     # Down payload is expert-major [E][K16][N16]
                                     # (K = intermediate, N = hidden). Stage the
@@ -8817,11 +9805,6 @@ class MoEDynamicKernelBackend:
                                     w4a8_b2_dst = (
                                         w4a8_sb0 + (w4a8_sb1 - w4a8_sb0) * par2
                                     )
-                                    rp_tile2 = (
-                                        task_expert_idx
-                                        * Int32(b_down_u32.shape[0] // 256)
-                                        + (_pt >> Int32(1))
-                                    ) * gate_tile_cnt + cur_slice_p
                                     _w4a8_stage_repacked_b_full(
                                         down_rp,
                                         w4a8_b2_dst,
@@ -8959,7 +9942,8 @@ class MoEDynamicKernelBackend:
                                 else:
                                     w4a8_sfb2_dst = w4a8_sfbb + (par2 << Int32(9))
                                 if cutlass.const_expr(
-                                    self.w4a8_repacked and not self.w4a8_trellis
+                                    self.w4a8_repacked
+                                    and not self.w4a8_trellis
                                 ):
                                     _w4a8_stage_repacked_sfb_full(
                                         down_sfb_rp,
@@ -8968,6 +9952,28 @@ class MoEDynamicKernelBackend:
                                         Int32(lane_id),
                                         32,
                                     )
+                                elif cutlass.const_expr(
+                                    self.w4a8_trellis and self.trellis_scaled
+                                ):
+                                    _w4a8_stage_bytes4(
+                                        sfb_down_mx,
+                                        w4a8_sfb2_dst,
+                                        dnsf_base_p + row_off_p * Int64(dnsf_row_p),
+                                        Int32(dnsf_row_p),
+                                        Int32(lane_id),
+                                        32,
+                                    )
+                                    if cutlass.const_expr(self.w4a8_fc2_pair):
+                                        _w4a8_stage_bytes4(
+                                            sfb_down_mx,
+                                            w4a8_sfb2_dst + Int32(512),
+                                            dnsf_base_p
+                                            + (row_off_p + Int64(128))
+                                            * Int64(dnsf_row_p),
+                                            Int32(dnsf_row_p),
+                                            Int32(lane_id),
+                                            32,
+                                        )
                                 elif cutlass.const_expr(not self.w4a8_trellis):
                                     _w4a8_stage_bytes4(
                                         sfb_down_mx,
