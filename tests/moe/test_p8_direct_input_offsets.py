@@ -67,6 +67,7 @@ def test_direct_input_high_payload_scale_stores_and_graph(row):
         fn(*ptrs, h512, current_cuda_stream())
     payload[-32:].zero_()
     scales[-1:].zero_()
+    offsets.zero_()
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(payload[-32:], low_payload[-32:], rtol=0, atol=0)

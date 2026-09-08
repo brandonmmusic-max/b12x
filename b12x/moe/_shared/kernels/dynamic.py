@@ -1075,6 +1075,11 @@ class MoEDynamicKernelBackend:
             and quant_recipe == "w4a8_trellis" and trellis_codebook == "mcg"
             and trellis_scaled and w4a8_repacked
         )
+        if self.p8_grouped_m16:
+            raise ValueError(
+                "P8 grouped-M16 is unsupported; use the supported direct "
+                "or grouped-M64 owner"
+            )
         # Opt-in closure diagnostic only. The P8 wrapper may enable this on a
         # dedicated compiled arm and provide a 512-byte carrier through the
         # otherwise compile-time-dead MCG trellis_lut operand. The ordinary
@@ -1238,11 +1243,7 @@ class MoEDynamicKernelBackend:
                     full_coupled=self.p8_full_coupled,
                     trellis_bits=trellis_bits,
                 )
-        if self.p8_grouped_m16:
-            from b12x.moe._shared.kernels.p8_grouped_m16 import P8GroupedM16FC1Kernel, P8GroupedM16FC2Kernel
-            self.materialized_phase1_kernel = P8GroupedM16FC1Kernel(trellis_bits=trellis_bits)
-            self.materialized_phase2_kernel = P8GroupedM16FC2Kernel(trellis_bits=trellis_bits)
-        elif self.p8_full_coupled and self.w4a8_m64_materialized:
+        if self.p8_full_coupled and self.w4a8_m64_materialized:
             from b12x.moe._shared.kernels.p8_coupled_prefill_fc1 import (
                 P8CoupledPrefillFC1Kernel,
             )

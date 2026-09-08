@@ -87,3 +87,15 @@ def test_noncoupled_materialized_owner_keeps_grouped_padding():
     shapes = {region.name: region.shape for region in layout.regions}
     assert shapes["packed_a"] == ((288 + 3) * 64 * 4096,)
     assert shapes["scale_flat"] == ((288 + 17 * 8 + 1) * 64 * 512,)
+
+
+def test_unimplemented_grouped_m16_rejected_before_kernel_import():
+    with pytest.raises(ValueError, match="P8 grouped-M16 is unsupported"):
+        MoEDynamicKernelBackend(
+            16, (16, 128), activation="silu", quant_recipe="w4a8_trellis",
+            trellis_bits=4, trellis_codebook="mcg", trellis_scaled=True,
+            w4a8_repacked=True, p8_full_coupled=True, p8_scale_sandwich=True,
+            trellis_coupled=True, materialize_intermediate=True,
+            direct_routing=False, share_input_across_experts=True,
+            deterministic_output=True,
+        )

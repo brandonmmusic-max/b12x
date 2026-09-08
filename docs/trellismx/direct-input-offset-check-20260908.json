@@ -9,7 +9,8 @@
       16777217
     ],
     "mode": "real large payload and scale allocations; exact low/high stores; graph replay; production integer helper",
-    "test_sha256": "0b4ee9fe064ff0928dddfcb114267ac6ea1addbb63ea23c5412b0c59dbfca3d5"
+    "test_sha256": "0b4ee9fe064ff0928dddfcb114267ac6ea1addbb63ea23c5412b0c59dbfca3d5",
+    "scope_note": "Historical run before offsets.zero_() rearming was added. Payload and scales were rearmed; the offsets-output graph assertion could observe eager output. Original test and candidate source hashes are preserved. See offsets_rearmed_followup for the separate stronger rerun."
   },
   "cpu_contracts_passed": 23,
   "cpu_ast": "exact transform prefix and whole-source AST modulo reviewed integer changes",
@@ -154,6 +155,22 @@
     }
   ],
   "resource_units": "Nsight raw CSV units: registers/thread; shared memory KB (1000 bytes), spill request counts",
-  "scope": "Index-only hardening. Two real rank0 MoE layers, not full-model KLD or throughput qualification. Normal-path resources identical across five launches in each K4/K5 probe. Baseline production image remains748f8; this PR patch is not promoted.",
-  "cache": "CuTe compiler package source-content fingerprint invalidates new-process binaries; fresh per-container cache directories used."
+  "scope": "Index-only hardening. Two real rank0 MoE layers, not full-model KLD or throughput qualification. Normal-path resources identical across five launches in each K4/K5 probe. Baseline production image remains sha256:748f8cc08a0307f5dad7c65daac7410df2bf516e3eed1284c7ecb17907ffabca; this PR patch is not promoted.",
+  "cache": "CuTe compiler package source-content fingerprint invalidates new-process binaries; fresh per-container cache directories used.",
+  "offsets_rearmed_followup": {
+    "status": "passed",
+    "passed": 2,
+    "skipped": 0,
+    "rows": [
+      524289,
+      16777217
+    ],
+    "test_sha256": "a71ea464d4d9424e964975a16ce8468f36b3d8f230c117d05c0144e43e5a4066",
+    "dynamic_sha256": "c7609ad0d7f41045a3d06cfe11828e982b54967cd789b4a4b12c28dce54f7ab5",
+    "image": "sha256:d565498edc119a376a78cd99990e7747f18cdc0b6705a95b3d62252eb1dee099",
+    "source": "B12X review checkout mounted read-only at /review; PYTHONPATH=/review:/opt/glm53-flash/vllm",
+    "command": "cd /review && /opt/venv/bin/python -m pytest --confcutdir=tests/moe -p no:cacheprovider tests/moe/test_p8_direct_input_offsets.py -q -rs",
+    "result": "..                                                                       [100%]\n2 passed in 4.10s",
+    "scope": "Fresh real large-pool probe with payload, scales and offsets rearmed before graph replay. Experimental TP2 adapter image used only as test environment; no model server or TP2 model path exercised. No new full-model KLD, throughput or normal-path resource qualification."
+  }
 }
