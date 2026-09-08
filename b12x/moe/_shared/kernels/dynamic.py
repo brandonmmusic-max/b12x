@@ -859,6 +859,13 @@ def _atomic_cas_global_i32(addr, compare, value, *, loc=None, ip=None):
     )
 
 
+@cute.jit
+def _p8_direct_input_block_offsets(h512: Int64, quarter: Int32, group: Int32):
+    """Return K32 scale index and E4M3 byte offset for a global H512 unit."""
+    block = Int64(h512) * Int64(16) + Int64(quarter) * Int64(4) + Int64(group)
+    return block, block * Int64(32)
+
+
 class MoEDynamicKernelBackend:
     """Fused route/pack + expert-compute kernel with a pluggable work source."""
 
@@ -3608,12 +3615,12 @@ class MoEDynamicKernelBackend:
                     # followed by K32 amax/E4M3/UE8M0 packing.
                     m1_warp = flat_tid >> Int32(5)
                     m1_warp_stride = flat_stride >> Int32(5)
-                    m1_h512 = m1_warp
-                    while m1_h512 < num_tokens * (mx_blocks_per_row // Int32(16)):
+                    m1_h512 = Int64(m1_warp)
+                    while m1_h512 < Int64(num_tokens) * Int64(mx_blocks_per_row // Int32(16)):
                         # One H512 unit per input row. Preserve the M1 order
                         # while permitting multiple direct-route tokens.
-                        p8_input_row = m1_h512 // (mx_blocks_per_row // Int32(16))
-                        p8_local_h512 = m1_h512 % (mx_blocks_per_row // Int32(16))
+                        p8_input_row = Int32(m1_h512 // Int64(mx_blocks_per_row // Int32(16)))
+                        p8_local_h512 = Int32(m1_h512 % Int64(mx_blocks_per_row // Int32(16)))
                         quarters = tuple(
                             cute.make_rmem_tensor((4,), cutlass.Float32)
                             for _quarter in range(4)
@@ -3702,7 +3709,9 @@ class MoEDynamicKernelBackend:
                                 _w4a8_trellis_permute_k32(m1_values), m1_block_max
                             )
                             if (m1_lane_id & Int32(7)) == Int32(0):
-                                m1_blk_idx = m1_h512 * Int32(16) + Int32(quarter * 4) + m1_group
+                                m1_blk_idx, m1_block_start = _p8_direct_input_block_offsets(
+                                    m1_h512, Int32(quarter), m1_group
+                                )
                                 if cutlass.const_expr(self.p8_input_prequant_diagnostic):
                                     # Exact diagnostic contract, logical order:
                                     #   f32[0:32]   raw K32 block 40
@@ -3743,17 +3752,16 @@ class MoEDynamicKernelBackend:
                                                 m1_values[trace_elem]
                                                 * trace_inv_scale,
                                             )
-                                m1_block_start = m1_blk_idx * Int32(32)
                                 for pair in cutlass.range_constexpr(4):
                                     packed64 = (
                                         Uint64(m1_payload[pair * 2 + 1]) << Uint64(32)
                                     ) | Uint64(m1_payload[pair * 2])
                                     st_global_u64(
-                                        get_ptr_as_int64(packed_a_storage, m1_block_start + Int32(pair * 8)),
+                                        get_ptr_as_int64(packed_a_storage, m1_block_start + Int64(pair * 8)),
                                         packed64,
                                     )
                                 scale_storage[m1_blk_idx] = Uint8(m1_scale_byte & Uint32(0xFF))
-                        m1_h512 += m1_warp_stride
+                        m1_h512 += Int64(m1_warp_stride)
                 elif cutlass.const_expr(self.p8_scale_sandwich):
                     # One warp owns one complete H128 input block.  Each lane
                     # loads four adjacent BF16 channels, applies signed suh in
