@@ -2614,7 +2614,7 @@ class MoEDynamicKernelBackend:
                 if (lane & Int32(7)) == Int32(0):
                     block = h512 * Int32(16) + Int32(quarter * 4) + group
                     block_start = block * Int32(32)
-                    payload_row = token_idx * Int32(a_input.shape[1])
+                    payload_row = Int64(token_idx) * Int64(a_input.shape[1])
                     for pair in cutlass.range_constexpr(4):
                         packed64 = (
                             Uint64(payload[pair * 2 + 1]) << Uint64(32)
@@ -2626,7 +2626,8 @@ class MoEDynamicKernelBackend:
                             ),
                             packed64,
                         )
-                    scale_storage[token_idx * mx_blocks_per_row + block] = Uint8(
+                    scale_row = Int64(token_idx) * Int64(mx_blocks_per_row)
+                    scale_storage[scale_row + Int64(block)] = Uint8(
                         scale_byte & Uint32(0xFF)
                     )
             h512 += Int32(self.input_warps_per_token)

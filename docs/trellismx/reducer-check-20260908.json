@@ -120,5 +120,5 @@
   "big_live_token_id": 65536,
   "big_route_element_offset": 2147483648,
   "big_offset_equal": true,
-  "timing_scope": "component-only ABBA, one GPU preparation; not whole-model speedup"
+  "timing_scope": "reduced component proxy, ABBA within one GPU preparation; cannot support production-path performance conclusions. Target-path benchmark metadata must be recorded separately before any serving-performance claim"
 }
