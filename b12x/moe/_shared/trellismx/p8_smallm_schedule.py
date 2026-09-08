@@ -56,7 +56,7 @@ class P8ScratchLayout:
     nbytes: int
 
 
-def p8_small_m_scratch_layout(*, intermediate: int = 512, tokens: int = 1, shared: bool = False) -> P8ScratchLayout:
+def p8_small_m_scratch_layout(*, intermediate: int = 512, tokens: int = 1, shared: bool = False, grouped: bool = False, tile_m: int | None = None, direct: bool | None = None) -> P8ScratchLayout:
     """Exact M1 buffer extents, each starting at a 16-byte-aligned offset.
 
     The route-output allocation is intentionally excluded. Padding between
@@ -65,12 +65,16 @@ def p8_small_m_scratch_layout(*, intermediate: int = 512, tokens: int = 1, share
     geometry = P8SmallMGeometry(intermediate=intermediate)
     if tokens < 1 or (tokens != 1 and not shared):
         raise ValueError('multi-token layout requires shared coupled workspace')
-    tile_m = 16 if tokens == 1 else 64
-    physical_tiles = geometry.physical_tiles if tokens == 1 else geometry.experts + (tokens * geometry.topk + tile_m - 1) // tile_m
+    tile_m = (64 if grouped else 16) if tile_m is None else tile_m
+    if tile_m not in (16, 64, 128):
+        raise ValueError("unsupported scratch tile size")
+    direct = not grouped if direct is None else direct
+    physical_tiles = (geometry.experts + (tokens * geometry.topk + tile_m - 1) // tile_m
+                      if not direct else tokens * geometry.topk)
     rows = physical_tiles * tile_m
     max_tasks = physical_tiles * (geometry.intermediate // 128)
-    input_rows = tokens if shared and tokens > 1 else rows
-    scale_elements = (tokens * (geometry.hidden // 32) if shared and tokens > 1
+    input_rows = tokens if shared and grouped else rows
+    scale_elements = (tokens * (geometry.hidden // 32) if shared and grouped
                       else (geometry.experts + tokens * geometry.topk + 1) * tile_m * (geometry.hidden // 8))
     specs = [
         ("packed_a", "uint8", (input_rows * geometry.hidden,)),

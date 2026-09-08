@@ -62,6 +62,9 @@ from cutlass.cutlass_dsl import (
 )
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync
+from b12x.moe._shared.kernels.w4a8_mcg_decode import (
+    packed_decode_mcg2_to_e4m3x8 as _packed_decode_trellis_mcg2_to_e4m3x8,
+)
 from b12x._lib.intrinsics import (
     atomic_add_global_i32,
     bfloat2_to_float2_scaled,
@@ -285,85 +288,6 @@ def _p8_h512_mix_reference_order(
     )
 
 
-@dsl_user_op
-def _packed_decode_trellis_mcg2_to_e4m3x8(
-    win_a,
-    win_b,
-    bits: int,
-    *,
-    loc=None,
-    ip=None,
-):
-    """Decode eight procedural MCG states directly to scaled E4M3 bytes.
-
-    This is the P8 law used by the no-LDLQ pseudoquant encoder: the original
-    ExLlamaV3 MCG state value is multiplied by the frozen family compander
-    ``2.0`` and rounded once to finite E4M3. The result stays in the native
-    B-register form consumed by ``mxf8f6f4.m16n8k32``.
-    """
-    bits = int(bits)
-    if bits not in (3, 4, 5):
-        raise ValueError(f"P8 MCG supports K3/K4/K5 trellis streams, got K{bits}")
-    asm = """
-        {
-            .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7, lo, hi, M;
-            .reg .b32 h01,h23,h45,h67;
-            .reg .b16 e01,e23,e45,e67;
-            mov.b32 M, 0xCBAC1FED;
-            and.b32 w7, $2, 0xffff;
-            shr.u32 w6, $2, __B1__;  and.b32 w6, w6, 0xffff;
-            shr.u32 w5, $2, __B2__;  and.b32 w5, w5, 0xffff;
-            shr.u32 w4, $2, __B3__;  and.b32 w4, w4, 0xffff;
-            and.b32 w3, $3, 0xffff;
-            shr.u32 w2, $3, __B1__;  and.b32 w2, w2, 0xffff;
-            shr.u32 w1, $3, __B2__;  and.b32 w1, w1, 0xffff;
-            shr.u32 w0, $3, __B3__;  and.b32 w0, w0, 0xffff;
-            mul.lo.u32 w0, w0, M;  lop3.b32 w0, w0, 0x8FFF8FFF, 0x3B603B60, 0x6a;
-            mul.lo.u32 w1, w1, M;  lop3.b32 w1, w1, 0x8FFF8FFF, 0x3B603B60, 0x6a;
-            mul.lo.u32 w2, w2, M;  lop3.b32 w2, w2, 0x8FFF8FFF, 0x3B603B60, 0x6a;
-            mul.lo.u32 w3, w3, M;  lop3.b32 w3, w3, 0x8FFF8FFF, 0x3B603B60, 0x6a;
-            mul.lo.u32 w4, w4, M;  lop3.b32 w4, w4, 0x8FFF8FFF, 0x3B603B60, 0x6a;
-            mul.lo.u32 w5, w5, M;  lop3.b32 w5, w5, 0x8FFF8FFF, 0x3B603B60, 0x6a;
-            mul.lo.u32 w6, w6, M;  lop3.b32 w6, w6, 0x8FFF8FFF, 0x3B603B60, 0x6a;
-            mul.lo.u32 w7, w7, M;  lop3.b32 w7, w7, 0x8FFF8FFF, 0x3B603B60, 0x6a;
-            prmt.b32 lo, w0, w1, 0x5410;  prmt.b32 hi, w0, w1, 0x7632;  add.rn.f16x2 h01, lo, hi;
-            prmt.b32 lo, w2, w3, 0x5410;  prmt.b32 hi, w2, w3, 0x7632;  add.rn.f16x2 h23, lo, hi;
-            prmt.b32 lo, w4, w5, 0x5410;  prmt.b32 hi, w4, w5, 0x7632;  add.rn.f16x2 h45, lo, hi;
-            prmt.b32 lo, w6, w7, 0x5410;  prmt.b32 hi, w6, w7, 0x7632;  add.rn.f16x2 h67, lo, hi;
-            add.rn.f16x2 h01, h01, h01;
-            add.rn.f16x2 h23, h23, h23;
-            add.rn.f16x2 h45, h45, h45;
-            add.rn.f16x2 h67, h67, h67;
-            cvt.rn.satfinite.e4m3x2.f16x2 e01, h01;
-            cvt.rn.satfinite.e4m3x2.f16x2 e23, h23;
-            cvt.rn.satfinite.e4m3x2.f16x2 e45, h45;
-            cvt.rn.satfinite.e4m3x2.f16x2 e67, h67;
-            mov.b32 $0, {e01, e23};
-            mov.b32 $1, {e45, e67};
-        }
-        """
-    asm = (
-        asm.replace("__B1__", str(bits))
-        .replace("__B2__", str(2 * bits))
-        .replace("__B3__", str(3 * bits))
-    )
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32(), T.i32()]),
-        [
-            Uint32(win_a).ir_value(loc=loc, ip=ip),
-            Uint32(win_b).ir_value(loc=loc, ip=ip),
-        ],
-        asm,
-        "=r,=r,r,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    lo = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
-    hi = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
-    return Uint32(lo), Uint32(hi)
 
 
 @cute.jit
@@ -1075,9 +999,7 @@ class MoEDynamicKernelBackend:
         self.w4a8_trellis = quant_recipe == "w4a8_trellis"
         if self.w4a8_trellis:
             if trellis_codebook is None:
-                trellis_codebook = os.environ.get(
-                    "B12X_TRELLIS_CODEBOOK", "sqg-xor-cheb-t12"
-                ).strip().lower()
+                trellis_codebook = "sqg-xor-cheb-t12"
             if trellis_codebook not in {"sqg-xor-cheb-t12", "mcg"}:
                 raise ValueError(
                     "w4a8_trellis codebook must be 'sqg-xor-cheb-t12' or "
@@ -2966,6 +2888,14 @@ class MoEDynamicKernelBackend:
                 1
             ] // 2 >= (self.tile_shape_mnk[0] * self.tile_shape_mnk[2]), (
                 "w4a8 needs ab_stage >= 2 to repurpose the sA staging region"
+            )
+        if cutlass.const_expr(self.p8_scale_sandwich or self.p8_full_coupled):
+            assert trellis_rotations is not None, (
+                "P8 transforms require the explicit FP16 transform/scale carrier"
+            )
+        if cutlass.const_expr(self.w4a8_trellis and self.trellis_scaled):
+            assert w13_sfb_rp is not None and down_sfb_rp is not None, (
+                "scaled trellis requires explicit repacked UE8M0 scales"
             )
         if cutlass.const_expr(sfb_w13_mx is None):
             sfb_w13_mx = row_counts  # unused placeholder under nvfp4

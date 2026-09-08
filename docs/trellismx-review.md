@@ -80,9 +80,9 @@ OpenAI assistance was used; human review is requested, not asserted.
 ## September 8 runtime evidence and overlay review
 
 See the [four-row KLD matrix and overlay reconciliation](trellismx/evidence-r27-20260908/README.md).
-The historical FP8/DCP1 score is0.0318077613; historical NVFP4/DCP1 is0.0341811459.
-Current r27 DCP4 scores are0.0350078183 (NVFP4) and0.0310574767 (FP8).
+The historical FP8/DCP1 score is 0.0318077613; historical NVFP4/DCP1 is 0.0341811459.
+Current r27 DCP4 scores are 0.0350078183 (NVFP4) and 0.0310574767 (FP8).
 These are external measured-image references, not GPU qualification of this PR head.
 
-Focused CPU checks after this review:31 loader/method tests passed;38 DCP tests
-passed with21 GPU tests skipped;14 B12X contract tests passed.
+Focused CPU checks : 31 loader/method tests passed; 38 DCP tests
+passed with 21 GPU tests skipped; 14 B12X contract tests passed.

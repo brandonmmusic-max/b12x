@@ -1,6 +1,6 @@
 {
   "schema": "trellismx.r27-kv-cf32.v1",
-  "evidence": "controlled comparison on already-opened conditional-fit; one prepared run per KV mode, fixed order; not final qualification",
+  "evidence": "research-only: controlled CF32 comparison; one prepared run per KV mode, fixed order",
   "arms": {
     "nvfp4": {
       "mean_true_decode_kld": 0.03500781830024326,
@@ -1007,7 +1007,6 @@
   "fp8_lower_windows": 26,
   "true_decode_rows_per_window": 2046,
   "windows": 32,
-  "historical_dcp1_context_only": 0.03418114591027796,
   "limits": [
     "DCP4 new versus DCP1 historical; different runtime image.",
     "MTP off and maxseq1 forced decode; not MTP quality or throughput evidence.",
@@ -1060,5 +1059,10 @@
       "measured_windows": 0,
       "failure": "Old capture hook assumed optional max_query_len was concrete; adapted guard validates actual scheduled offsets."
     }
-  ]
+  ],
+  "input_identity": {
+    "role_manifest_sha256": "b5d7e4524eb98ddfbd230a5d9a44de0dc5dbeb796c03e859898b5838e4463d14",
+    "teacher_revision": "7c378d5f17dba158c4c803eff27c346dd0615660",
+    "window_list": "arms.nvfp4.per_window and arms.fp8.per_window"
+  }
 }

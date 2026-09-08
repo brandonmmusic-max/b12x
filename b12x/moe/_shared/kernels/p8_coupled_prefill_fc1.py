@@ -4,10 +4,10 @@ This specializes the CPU/static-validated N128 owner used by decode.  It
 changes only M ownership and grouped-task traversal: four M16 MMA fragments
 cover an M64 tile, while every H128 transform remains inside one CTA.  The
 procedural-MCG stream, E4M3/UE8M0/32 operands and native mxf8f6f4 MMA are
-unchanged; the stored rate comes from ``trellis_bits`` and only rescales the
-B-operand staging, exactly as on the decode owner, so K4 is bit-identical to
-the pre-rate build.  Device closure is deliberately still required before
-enablement, and the M1 closure does not exercise this grouped path.
+unchanged. The stored rate comes from ``trellis_bits`` and controls B-operand
+staging. The decode reference is ``p8_h128_fc1.py:P8H128FC1Kernel``; its numerical
+boundary is specified by ``trellismx/p8_coupled_scales.py``. Decode-only tests do
+not qualify this grouped prefill path.
 """
 from __future__ import annotations
 

@@ -131,8 +131,8 @@ class P8NativeTPMoE:
         self.shared_workspace = bool(shared_workspace)
         self.tp_rank = int(tp_rank)
         self.world_size = int(world_size)
-        if self.world_size not in (2,4) or self.tp_rank not in range(self.world_size):
-            raise ValueError("P8 native requires TP2/TP4 rank")
+        if self.world_size != 4 or self.tp_rank not in range(4):
+            raise ValueError("P8 native supports TP4 only; TP2 validators are unsupported")
         self.layer = int(layer)
         if not 3 <= self.layer <= 44:
             raise ValueError("P8 native layer must be in GLM routed layers 3..44")
@@ -260,6 +260,10 @@ class P8NativeTPMoE:
         self.experts = experts
         self.scale_component = None
         self.full_coupled = bool(full_coupled_schema)
+        if (self.grouped_m16 or self.fuse_grouped_scratch) and not self.full_coupled:
+            raise ValueError("grouped scratch requires the full-coupled kernel owner")
+        if self.fuse_grouped_scratch and not self.grouped_m16:
+            raise ValueError("fused grouped scratch requires grouped_m16")
         if self.shared_workspace and (not self.full_coupled or self.debug_capture or self.fuse_scratch_zero):
             raise ValueError('shared workspace requires full coupling without retained debug tensors or fused arena')
         if self.compact_scale_storage and not self.full_coupled:
@@ -516,16 +520,11 @@ class P8NativeTPMoE:
             current_cuda_stream(),
             fake_ptr_u8(),
             ptr(cutlass.Float16, 16),
-            # The explicit spec IS the JIT cache key, in memory and on disk. Every
-            # field the kernel is specialised on must appear here: the stored
-            # trellis rate was missing, so in a mixed-rate model the first rate
-            # compiled per rank was served for every layer (K3, K4 and K5 alike),
-            # while single-rate closures could never see it. Version 2 retires
-            # any rate-less cache entries. Version 3 also retires pre-TP2
-            # epilogue specializations while retaining the stored-rate field.
+            # The compile spec is the JIT cache key and includes every specialized
+            # field, especially stored rate, topology and epilogue dimensions.
             compile_spec=KernelCompileSpec.from_fields(
                 "glm53.p8.native.tp",
-                3,
+                4,
                 ("trellis_bits", self.trellis_bits),
                 ("tile_major_tasks", int(self.tile_major_tasks and small_m)),
                 ("fc1_pipeline_stages", self.fc1_pipeline_stages if small_m else 2),
@@ -576,7 +575,7 @@ class P8NativeTPMoE:
             current_cuda_stream(),
             compile_spec=KernelCompileSpec.from_fields(
                 "glm53.p8.coupled_topk_h512",
-                1,
+                2,
                 ("topk", self.topk),
                 ("hidden", self.hidden),
                 ("rank", self.tp_rank),
@@ -650,8 +649,10 @@ class P8NativeTPMoE:
             if fused_scratch_zero:
                 from .p8_multirow_scratch import direct_scratch_layout, grouped_m16_scratch_layout
                 self._scratch_layout = (direct_scratch_layout(m, self.intermediate) if small_m
-                    else grouped_m16_scratch_layout(m, self.intermediate, self.compact_input_storage))
-            layout = (p8_small_m_scratch_layout(intermediate=self.intermediate, tokens=m, shared=True)
+                    else grouped_m16_scratch_layout(m, self.intermediate, self.compact_input_storage,
+                        grouped=self.full_coupled and materialized and not small_m))
+            layout = (p8_small_m_scratch_layout(intermediate=self.intermediate, tokens=m, shared=True,
+                          grouped=self.full_coupled and materialized and not small_m, tile_m=tile_m, direct=small_m)
                       if self.shared_workspace else self._scratch_layout)
             assert layout is not None
             # A single GPU fill initializes all original bytes plus alignment

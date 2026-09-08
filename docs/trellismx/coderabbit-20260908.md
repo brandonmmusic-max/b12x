@@ -1,0 +1,12 @@
+# Review dispositions
+
+Implemented: remove dead pre-H128 shared stores/barrier; Int64 route/output extents and offset products with a live >2^31 test; explicit codebook selection independent of environment; validate scales/transform before placeholder substitution; share procedural MCG decode implementation; reject unsupported TP2; bind scratch geometry to dispatched direct/grouped owner; reject incompatible grouped flags; distinguish H128 FC1 class name from identity FC1; context-independent transform and compile-key prose; explicit evidence failures under -O; per-arm audit flags/counts; bind historical comparison by hash and narrow equality claim to tokens/window order; remove unbound historical scalar instead of conflating FP8 with NVFP4; document corpus/role manifest and research-only status; narrow current identity-verification claim to the fields actually checked; TP4/DCP4 launcher admission; bounded numeric input strings; clean pinned CPU dependency check; skip optional B12X-dependent vLLM tests; register/cache TrellisMX environment opt-in; release persistent DCP workspace caches on teardown.
+
+Deferred with source reasons:
+- Consolidating phase-0 full-coupled transform with the shared producer helper: the helper advances by input_warps_per_token, while phase0 spans CTA/grid-owned H512 units. A direct replacement changes traversal ownership; requires a separately designed equivalence test. Existing arithmetic retained.
+- Unifying entire FC1 classes: identity and H128 paths have different intermediate width, route bounds, epilogue transform and rounding. Renamed the H128-local variant to remove ambiguous class identity; numerical consolidation is not a safe mechanical fix.
+- phase2 staging-helper extraction: duplicated code is equivalent and valid; no dead stores/barrier identified there. Deferred code-motion refactor to keep GPU validation focused on changed behavior.
+- prequantization diagnostic carrier refactor: existing explicit diagnostic wrapper binds the carrier, and production has the diagnostic flag disabled. Removing its trace facility would remove a numerical investigation tool; no production numerical change made.
+- Low-value chronology cleanup outside touched invariants: deferred; not serving correctness or speed work.
+
+These deferred suggestions are not represented as implemented or resolved. GPU/source tests and updated PR descriptions must distinguish production overlay base from the older PR base.

@@ -17,8 +17,6 @@
   "dcp": 1,
   "mtp": false,
   "windows": 32,
-  "same_current_windows_and_order": true,
-  "same_input_and_token_hashes": true,
   "role_manifest_sha256": "b5d7e4524eb98ddfbd230a5d9a44de0dc5dbeb796c03e859898b5838e4463d14",
   "mean_true_decode_kld": 0.03180776125099182,
   "window_bca95": [
@@ -733,5 +731,13 @@
       "window_id": "conditional-fit-0118"
     }
   ],
-  "boundary": "Replayed retained score arrays and hashes; not a new capture or independent reproduction. Source score raw_retired flag is capture-time metadata; later retirement receipts are separate."
+  "boundary": "Replayed retained score arrays and hashes; not a new capture or independent reproduction. Source score raw_retired flag is capture-time metadata; later retirement receipts are separate.",
+  "comparison_binding": {
+    "file": "comparison.json",
+    "sha256": "ca44de747832277326e23feac33a2671fb8ab490185f3212e912dbff48b63560",
+    "verified_equalities": [
+      "window order",
+      "token_values_sha256 equals token_sha256"
+    ]
+  }
 }

@@ -52,3 +52,38 @@ def test_fc_owners_cover_selected_experts_without_overlap():
     assert len({geometry.fc2_owner(i) for i in range(geometry.fc2_tasks)}) == 128
     with pytest.raises(ValueError):
         geometry.fc1_owner(geometry.fc1_tasks)
+
+
+def test_environment_cannot_change_default_artifact_codebook(monkeypatch):
+    monkeypatch.setenv("B12X_TRELLIS_CODEBOOK", "mcg")
+    assert make_kernel(4, None).trellis_codebook == "sqg-xor-cheb-t12"
+
+
+@pytest.mark.parametrize("tokens", [1, 4, 16])
+def test_direct_owner_retains_padded_input_and_scale_extents(tokens):
+    layout = p8_small_m_scratch_layout(tokens=tokens, shared=True, grouped=False)
+    shapes = {region.name: region.shape for region in layout.regions}
+    assert shapes["packed_a"] == (tokens * 8 * 16 * 4096,)
+    assert shapes["scale_flat"] == ((288 + tokens * 8 + 1) * 16 * 512,)
+
+
+@pytest.mark.parametrize("tokens", [1, 4, 128])
+def test_grouped_owner_uses_compact_input_and_scale_planes(tokens):
+    layout = p8_small_m_scratch_layout(tokens=tokens, shared=True, grouped=True)
+    shapes = {region.name: region.shape for region in layout.regions}
+    assert shapes["packed_a"] == (tokens * 4096,)
+    assert shapes["scale_flat"] == (tokens * 128,)
+
+
+def test_unsupported_tp2_rejected_before_sidecar_access():
+    from b12x.moe._shared.trellismx.p8_native_kernel import P8NativeTPMoE
+    with pytest.raises(ValueError, match="TP4 only"):
+        P8NativeTPMoE("/does/not/exist", layer=3, tp_rank=0, world_size=2, device="cpu")
+
+
+def test_noncoupled_materialized_owner_keeps_grouped_padding():
+    layout = p8_small_m_scratch_layout(tokens=17, shared=True, grouped=False,
+                                      tile_m=64, direct=False)
+    shapes = {region.name: region.shape for region in layout.regions}
+    assert shapes["packed_a"] == ((288 + 3) * 64 * 4096,)
+    assert shapes["scale_flat"] == ((288 + 17 * 8 + 1) * 64 * 512,)

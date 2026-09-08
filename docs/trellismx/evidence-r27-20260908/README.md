@@ -32,19 +32,19 @@ The historical row-count correction changes wording only, not numerical scores.
 
 The current pair changes KV representation/backend specialization within one
 fixed r27 image and DCP4 configuration. FP8 minus NVFP4 is -0.003950341606200488,
-paired-window BCa95 [-0.00925104571170184, -0.0018107907382052357], lower in26/32
+paired-window BCa95 [-0.00925104571170184, -0.0018107907382052357], lower in 26/32
 windows. One server start per arm, fixed NVFP4-then-FP8 order; window intervals
 do not measure run-to-run variability. Current prefix caching stays enabled
 for hybrid-cache alignment with zero hits at every measured window boundary.
 
 Historical-to-current FP8 also changes FlashInfer to B12X, image, topology and
 runtime configuration. It does not establish a DCP4-only accuracy benefit.
-The missing historical FP8 run was located and audited after the first card
-publication; its exact score is0.0318077613, whereas0.0341811459 belongs to NVFP4.
+The retained historical FP8 score is 0.0318077613; the historical NVFP4 score
+is 0.0341811459.
 Both historical KV modes were measured. The old FP8 interval uses NumPy
 `default_rng(20260902)`; the current pair uses legacy `RandomState(20260902)`.
-Both use20,000 BCa resamples. Retained historical score arrays reproduce the
-full float64 mean exactly; both CI endpoints replay within1e-15.
+Both use 20,000 BCa resamples. Retained historical score arrays reproduce the
+full float64 mean exactly; both CI endpoints replay within 1e-15.
 
 Current receipts: `comparison.json` and `audit.json`. Historical FP8 retained-score
 and input-hash audit: `historical-fp8-audit.json`. Raw logits, teacher tensors,
@@ -94,7 +94,7 @@ no compact-buffer or scheduler change is selected by this evidence.
 
 Focused CPU loader/method, DCP and B12X contracts are run with no GPU devices.
 The receipt checker verifies public artifact hashes, matched windows, score
-aggregation and runtime identities; it does not execute the model or turn
+aggregation and historical FP8 runtime labels and current capture-image identity; it does not execute the model or turn
 external KLD into a passing GPU test of this PR head.
 
 Codex and the local GLM-5.3-Flash TrellisMX reviewer cross-reviewed the proposed

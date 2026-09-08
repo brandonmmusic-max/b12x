@@ -62,7 +62,7 @@ from b12x.moe._shared.kernels.w4a8_phase1 import W4A8MaterializedPhase1Kernel
 
 @dsl_user_op
 def _p8_pack_f32x2_to_half2(x0, x1, *, loc=None, ip=None):
-    """Pack FP32 to FP16x2 with the Luke reference's RN storage cast."""
+    """Pack FP32 to FP16x2 with the FP16-store-before-Hadamard reference in p8_coupled_scales.py's RN storage cast."""
 
     return Uint32(
         llvm.inline_asm(
@@ -101,7 +101,7 @@ def _p8_ld_shared_f16_to_f32(addr, *, loc=None, ip=None):
     )
 
 
-class P8NarrowFC1Kernel(W4A8MaterializedPhase1Kernel):
+class P8H128NarrowFC1Kernel(W4A8MaterializedPhase1Kernel):
     p8_tile_major = False
     p8_pipeline_stages = 2
     p8_n8_per_warp = 4
@@ -189,7 +189,7 @@ class P8NarrowFC1Kernel(W4A8MaterializedPhase1Kernel):
         expert_idx: Int32,
         local_col: Int32,
     ) -> cutlass.Float32:
-        """Apply private down suh with Luke's FP32-mul -> FP16-store order."""
+        """Apply private down suh with FP32 multiply followed by FP16 store before H128 (p8_coupled_scales.py)."""
 
         scale_idx = (
             Int32(4096)
@@ -1245,7 +1245,7 @@ class P8NarrowFC1Kernel(W4A8MaterializedPhase1Kernel):
             task += Int32(gdimz)
 
 
-class P8H128FC1Kernel(P8NarrowFC1Kernel):
+class P8H128FC1Kernel(P8H128NarrowFC1Kernel):
     """One-CTA N128 owner for the H128 scale-sandwich boundary."""
 
     def __init__(self, *, full_coupled: bool = False, trellis_bits: int = 4):
